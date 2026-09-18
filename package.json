@@ -1,0 +1,14 @@
+{
+  "name": "claudinio-code-intel",
+  "version": "0.1.0",
+  "description": "Local hybrid code search (tree-sitter + BM25 + MiniLM) as an MCP server — Claudinio Code's code intelligence for Claude Code, Cursor and GitHub Copilot",
+  "license": "MIT",
+  "type": "module",
+  "bin": { "claudinio-code-intel": "bin/launcher.mjs" },
+  "files": ["bin/", "README.md", "LICENSE"],
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test tests/*.test.mjs" },
+  "repository": { "type": "git", "url": "https://github.com/claudin-io/code-intel.git" },
+  "homepage": "https://github.com/claudin-io/code-intel",
+  "keywords": ["mcp", "code-search", "semantic-search", "tree-sitter", "claude-code", "cursor", "copilot", "plugin"]
+}

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "code-intel": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/bin/launcher.mjs"
+      ],
+      "env": {
+        "CODE_INTEL_WORKSPACE": "${CLAUDE_PROJECT_DIR}"
+      }
+    }
+  }
+}

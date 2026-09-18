@@ -1,0 +1,33 @@
+{
+  "name": "claudinio",
+  "owner": {
+    "name": "Claudinio",
+    "email": "support@claudin.io"
+  },
+  "metadata": {
+    "description": "Claudinio plugins for coding agents",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "code-intel",
+      "source": "./",
+      "description": "Local hybrid code search for your workspace \u2014 tree-sitter symbols, BM25 full-text and MiniLM semantic embeddings, fused. Claudinio Code's code intelligence as MCP tools: semantic_search, code_search, symbol_lookup, file_outline, find_callers. Nothing leaves the machine.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Claudinio",
+        "email": "support@claudin.io",
+        "url": "https://claudin.io"
+      },
+      "license": "MIT",
+      "keywords": [
+        "code-search",
+        "semantic-search",
+        "mcp",
+        "tree-sitter",
+        "embeddings",
+        "navigation"
+      ]
+    }
+  ]
+}

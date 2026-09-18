@@ -1,0 +1,22 @@
+{
+  "name": "code-intel",
+  "version": "0.1.0",
+  "description": "Local hybrid code search for your workspace \u2014 tree-sitter symbols, BM25 full-text and MiniLM semantic embeddings, fused. Claudinio Code's code intelligence as MCP tools: semantic_search, code_search, symbol_lookup, file_outline, find_callers. Nothing leaves the machine.",
+  "author": {
+    "name": "Claudinio",
+    "email": "support@claudin.io",
+    "url": "https://claudin.io"
+  },
+  "homepage": "https://github.com/claudin-io/code-intel",
+  "repository": "https://github.com/claudin-io/code-intel",
+  "license": "MIT",
+  "keywords": [
+    "code-search",
+    "semantic-search",
+    "mcp",
+    "tree-sitter",
+    "embeddings",
+    "navigation"
+  ],
+  "mcpServers": "./.mcp.json"
+}
