@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.backend }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: ort
+            args: ""
+          - backend: candle
+            args: "--no-default-features --features embeddings-candle"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.backend }}
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - run: cargo build --workspace ${{ matrix.args }}
+      - run: cargo test --workspace ${{ matrix.args }}
+      # The server must answer an MCP handshake and index a real tree —
+      # this repo — without an embedding model.
+      - name: MCP smoke (lexical)
+        run: |
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+          | timeout 120 cargo run -q -p claudinio-code-intel-mcp ${{ matrix.args }} -- --no-embeddings --workspace . \
+          | tee /tmp/mcp.out
+          grep -q '"name":"semantic_search"' /tmp/mcp.out
+
+  node:
+    name: Launcher + manifests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
