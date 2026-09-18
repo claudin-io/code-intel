@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Local code intelligence: tree-sitter symbols, SQLite FTS5 and MiniLM embeddings fused into one hybrid search. Extracted from Claudinio Code."
-repository = "https://github.com/claudin-io/claudinio-code-intel"
+repository = "https://github.com/claudin-io/code-intel"
 keywords = ["code-search", "tree-sitter", "embeddings", "mcp"]
 
 [lib]

@@ -155,3 +155,19 @@ test("the skill names only tools the server actually registers", () => {
     assert.ok(registered.includes(named[1]), `${named[1]} is mentioned in the skill but not a registered tool`);
   }
 });
+
+test("every repository URL in the tree points at claudin-io/code-intel", () => {
+  const files = [
+    "package.json", "plugin.json", ".claude-plugin/plugin.json", ".cursor-plugin/plugin.json",
+    "crates/code-intel-mcp/Cargo.toml", "crates/code-intel/Cargo.toml",
+    "crates/code-intel-mcp/src/main.rs", "README.md",
+  ];
+  for (const f of files) {
+    const text = fs.readFileSync(path.join(root, f), "utf8");
+    for (const m of text.matchAll(/github\.com\/claudin-io\/([\w-]+)/g)) {
+      // claudinio-code is the upstream app the crate came from; anything
+      // else under claudin-io is the plugin's own repo and must be code-intel.
+      assert.ok(["code-intel", "claudinio-code"].includes(m[1]), `${f} links to ${m[0]}`);
+    }
+  }
+});

@@ -456,7 +456,7 @@ impl ServerHandler for CodeIntel {
                     .with_description(
                         "Local hybrid code search: tree-sitter symbols + BM25 + MiniLM embeddings. Nothing leaves the machine.",
                     )
-                    .with_website_url("https://github.com/claudin-io/claudinio-code-intel"),
+                    .with_website_url("https://github.com/claudin-io/code-intel"),
             )
             .with_instructions(
                 "Code navigation for the open workspace, indexed locally. Prefer semantic_search \

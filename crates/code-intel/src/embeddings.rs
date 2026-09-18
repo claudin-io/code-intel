@@ -841,7 +841,7 @@ pub fn model_marker_filename() -> &'static str {
 /// never fetches the ONNX graph.
 pub fn required_model_files() -> Vec<(String, &'static str, &'static str, u64)> {
     let base_url = format!("https://huggingface.co/{}/resolve/main", ACTIVE_MODEL.repo);
-    let mut out: Vec<(String, &'static str, &'static str, u64)> = ACTIVE_MODEL
+    let out: Vec<(String, &'static str, &'static str, u64)> = ACTIVE_MODEL
         .files
         .iter()
         .filter(|(_, local, _, _)| {
@@ -851,12 +851,17 @@ pub fn required_model_files() -> Vec<(String, &'static str, &'static str, u64)> 
         .map(|(remote, local, sha, len)| (format!("{base_url}/{remote}"), *local, *sha, *len))
         .collect();
     #[cfg(all(feature = "embeddings-candle", not(feature = "embeddings")))]
-    out.push((
-        CANDLE_WEIGHTS.0.to_string(),
-        CANDLE_WEIGHTS.1,
-        CANDLE_WEIGHTS.2,
-        CANDLE_WEIGHTS.3,
-    ));
+    {
+        let mut out = out;
+        out.push((
+            CANDLE_WEIGHTS.0.to_string(),
+            CANDLE_WEIGHTS.1,
+            CANDLE_WEIGHTS.2,
+            CANDLE_WEIGHTS.3,
+        ));
+        return out;
+    }
+    #[cfg(not(all(feature = "embeddings-candle", not(feature = "embeddings"))))]
     out
 }
 
