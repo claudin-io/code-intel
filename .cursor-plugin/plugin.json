@@ -1,6 +1,6 @@
 {
   "name": "code-intel",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local hybrid code search for your workspace \u2014 tree-sitter symbols, BM25 full-text and MiniLM semantic embeddings, fused. Claudinio Code's code intelligence as MCP tools: semantic_search, code_search, symbol_lookup, file_outline, find_callers. Nothing leaves the machine.",
   "author": {
     "name": "Claudinio",

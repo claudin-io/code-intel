@@ -1,6 +1,6 @@
 [package]
 name = "claudinio-code-intel-mcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "MCP server exposing Claudinio Code's local code intelligence (hybrid BM25 + MiniLM search over tree-sitter symbols) to Claude Code, Cursor and GitHub Copilot."

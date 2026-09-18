@@ -1,6 +1,6 @@
 {
   "name": "claudinio-code-intel",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local hybrid code search (tree-sitter + BM25 + MiniLM) as an MCP server — Claudinio Code's code intelligence for Claude Code, Cursor and GitHub Copilot",
   "license": "MIT",
   "type": "module",

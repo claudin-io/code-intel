@@ -1,6 +1,6 @@
 [package]
 name = "claudinio-code-intel"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "Local code intelligence: tree-sitter symbols, SQLite FTS5 and MiniLM embeddings fused into one hybrid search. Extracted from Claudinio Code."

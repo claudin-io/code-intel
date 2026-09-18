@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "claudinio-code-intel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "claudinio-code-intel-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "claudinio-code-intel",
  "dirs",
