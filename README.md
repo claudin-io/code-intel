@@ -85,11 +85,12 @@ and `CODE_INTEL_WORKSPACE` override that.
 |---|---|
 | `linux-x64`, `linux-arm64` | glibc Linux |
 | `linux-x64-baseline` | x86-64 CPUs without AVX2/BMI2 (picked automatically from `/proc/cpuinfo`) |
-| `darwin-arm64`, `darwin-x64` | macOS |
+| `darwin-arm64` | Apple Silicon macOS |
+| `darwin-x64` | Intel macOS (candle backend: ONNX Runtime ships no Intel Mac build) |
 | `win32-x64`, `win32-arm64` | Windows 10+ |
 | `win32-x64-baseline` | pre-Haswell Windows; set `CODE_INTEL_VARIANT=baseline` |
 
-The `-baseline` builds swap ONNX Runtime for the pure-Rust `candle` backend:
+The `-baseline` and `darwin-x64` builds swap ONNX Runtime for the pure-Rust `candle` backend:
 same model, same vectors, slower.
 
 ## Configuration
