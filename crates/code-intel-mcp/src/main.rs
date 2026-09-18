@@ -52,7 +52,7 @@ struct QueryParams {
     /// Maximum results (default 20).
     #[serde(default)]
     limit: Option<i64>,
-    /// Workspace root to search when more than one is open (default: first).
+    /// Absolute path of the project to search. Opens it if it is not indexed yet; when omitted the first open workspace answers.
     #[serde(default)]
     workspace: Option<String>,
 }
@@ -65,7 +65,7 @@ struct SemanticParams {
     /// Maximum results (default 15).
     #[serde(default)]
     limit: Option<i64>,
-    /// Workspace root to search when more than one is open (default: first).
+    /// Absolute path of the project to search. Opens it if it is not indexed yet; when omitted the first open workspace answers.
     #[serde(default)]
     workspace: Option<String>,
 }
@@ -74,7 +74,7 @@ struct SemanticParams {
 struct NameParams {
     /// Exact symbol name (case-insensitive).
     name: String,
-    /// Workspace root to search when more than one is open (default: first).
+    /// Absolute path of the project to search. Opens it if it is not indexed yet; when omitted the first open workspace answers.
     #[serde(default)]
     workspace: Option<String>,
 }
@@ -95,7 +95,7 @@ struct CallersParams {
     /// File that defines it; callers inside this file are excluded (default: none excluded).
     #[serde(default)]
     file_path: Option<String>,
-    /// Workspace root to search when more than one is open (default: first).
+    /// Absolute path of the project to search. Opens it if it is not indexed yet; when omitted the first open workspace answers.
     #[serde(default)]
     workspace: Option<String>,
 }
@@ -226,25 +226,42 @@ impl CodeIntel {
         workspace: Option<&str>,
         file_path: Option<&str>,
     ) -> Result<Arc<Workspace>, String> {
-        let list = self.workspaces.read().await;
-        if list.is_empty() {
-            return Err("no workspace open — call open_workspace with a directory".into());
-        }
         if let Some(w) = workspace {
             let want = canonical(Path::new(w));
-            return list
+            let known = self
+                .workspaces
+                .read()
+                .await
                 .iter()
                 .find(|ws| ws.root == want)
-                .cloned()
-                .ok_or_else(|| {
-                    let open: Vec<String> =
-                        list.iter().map(|w| w.root.display().to_string()).collect();
-                    format!(
-                        "workspace {} is not open; open: {}",
+                .cloned();
+            return match known {
+                Some(ws) => Ok(ws),
+                // An absolute directory the agent names is the project it is
+                // working in (the only way Copilot can tell us): open it.
+                None if want.is_absolute() && want.is_dir() => self.open_root(want).await,
+                None => {
+                    let open: Vec<String> = self
+                        .workspaces
+                        .read()
+                        .await
+                        .iter()
+                        .map(|w| w.root.display().to_string())
+                        .collect();
+                    Err(format!(
+                        "workspace {} is not an open workspace nor a directory; open: [{}]",
                         want.display(),
                         open.join(", ")
-                    )
-                });
+                    ))
+                }
+            };
+        }
+        let list = self.workspaces.read().await;
+        if list.is_empty() {
+            return Err(
+                "no workspace open — pass the project's absolute path as `workspace`, or call open_workspace"
+                    .into(),
+            );
         }
         if let Some(f) = file_path {
             let fp = Path::new(f);
@@ -319,7 +336,7 @@ impl CodeIntel {
 
     #[tool(
         name = "open_workspace",
-        description = "Index an additional directory (absolute path). The client's workspace is opened automatically at startup; use this only for a directory outside it."
+        description = "Index a directory (absolute path). Call it with the project root when index_status lists no workspace, or for a second directory outside the project. Every search tool also accepts `workspace` and opens it on demand."
     )]
     async fn open_workspace(&self, Parameters(p): Parameters<OpenParams>) -> Result<String, String> {
         let ws = self.open_root(PathBuf::from(&p.path)).await?;
@@ -462,9 +479,11 @@ impl ServerHandler for CodeIntel {
                 "Code navigation for the open workspace, indexed locally. Prefer semantic_search \
                  (meaning or a rare term anywhere in code/docs) and code_search (symbol names) over \
                  grep; file_outline before reading a whole file; find_callers for usages. Queries \
-                 must be in English. If a tool reports the index is not ready, call index_status \
-                 and retry — the first scan takes seconds, embeddings run for a few minutes in the \
-                 background and search works lexically meanwhile.",
+                 must be in English. Pass the project's absolute path as `workspace` on the first \
+                 call — some hosts never tell the server which directory you are working in, and \
+                 a tool then answers \"no workspace open\". If a tool reports the index is not \
+                 ready, call index_status and retry — the first scan takes seconds, embeddings run \
+                 for a few minutes in the background and search works lexically meanwhile.",
             )
     }
 
@@ -571,6 +590,42 @@ fn parse_args() -> Cli {
     cli
 }
 
+/// Variables the plugin hosts set to the plugin's own install directory.
+const PLUGIN_ROOT_VARS: [&str; 4] = [
+    "PLUGIN_ROOT",
+    "CLAUDE_PLUGIN_ROOT",
+    "COPILOT_PLUGIN_ROOT",
+    "CURSOR_PLUGIN_ROOT",
+];
+
+/// The workspace to index when neither `--workspace` nor
+/// `$CODE_INTEL_WORKSPACE` was given: the cwd, unless the host started us
+/// inside the plugin's own install directory (Copilot does, and advertises
+/// no roots and no project-dir variable). Indexing that would answer every
+/// question about the plugin instead of the user's project, so we start with
+/// nothing open and let the agent name the directory in `workspace` /
+/// `open_workspace`.
+fn default_workspace(
+    cwd: &Path,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let cwd = canonical(cwd);
+    let inside_plugin = PLUGIN_ROOT_VARS
+        .iter()
+        .filter_map(|k| env(k))
+        .filter(|v| !v.is_empty())
+        .any(|v| cwd == canonical(Path::new(&v)));
+    if inside_plugin {
+        tracing::info!(
+            cwd = %cwd.display(),
+            "cwd is the plugin install dir; waiting for the agent to name a workspace"
+        );
+        None
+    } else {
+        Some(cwd)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // stdout is the MCP transport; every log line goes to stderr.
@@ -614,7 +669,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // first search lands on a warm index; client roots are added on
     // `initialized` and no-op when they are the same directory.
     let initial = if cli.workspaces.is_empty() {
-        vec![std::env::current_dir()?]
+        default_workspace(&std::env::current_dir()?, |k| std::env::var_os(k))
+            .into_iter()
+            .collect()
     } else {
         cli.workspaces.clone()
     };
@@ -627,4 +684,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(dir: &Path) -> Options {
+        Options { cache_dir: dir.join("cache"), embeddings: false }
+    }
+
+    /// Copilot starts the server with cwd = the plugin's own install dir and
+    /// tells us so through PLUGIN_ROOT; indexing that would answer every
+    /// question about the plugin instead of the user's project.
+    #[test]
+    fn the_plugin_install_dir_is_never_the_default_workspace() {
+        let plugin = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let env = |k: &str| (k == "COPILOT_PLUGIN_ROOT").then(|| plugin.path().as_os_str().to_owned());
+        assert_eq!(default_workspace(plugin.path(), env), None);
+        assert_eq!(default_workspace(project.path(), env), Some(canonical(project.path())));
+        assert_eq!(default_workspace(plugin.path(), |_| None), Some(canonical(plugin.path())));
+    }
+
+    /// The agent passes the project path as `workspace` before anything is
+    /// open (Copilot has no roots and no project-dir variable): that must
+    /// open the directory, not report "not open".
+    #[tokio::test]
+    async fn pick_opens_an_absolute_directory_that_is_not_open_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir(&project).unwrap();
+        let server = CodeIntel::new(opts(tmp.path()));
+        let ws = server.pick(Some(project.to_str().unwrap()), None).await.unwrap();
+        assert_eq!(ws.root, canonical(&project));
+        assert_eq!(server.workspaces.read().await.len(), 1);
+        // and a path that is not a directory still errors
+        let missing = tmp.path().join("nope");
+        assert!(server.pick(Some(missing.to_str().unwrap()), None).await.is_err());
+    }
 }

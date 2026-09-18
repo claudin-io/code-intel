@@ -61,8 +61,14 @@ The index follows edits live (file watcher). If `index_status` reports a
 `watcherWarning`, edits made in this session may not be reflected; re-run
 the search after saving or restart the server.
 
-## Multiple workspaces
+## Which directory is indexed
 
-The server indexes the client's workspace root automatically. To search a
-second directory, call `open_workspace` with its absolute path, then pass
-`workspace` on later calls to choose which one answers.
+Claude Code and Cursor tell the server the project root at startup. GitHub
+Copilot does not — it starts the server inside the plugin's own folder and
+sends no roots — so the server starts with **no workspace open** there and a
+tool answers `no workspace open`. When that happens (or `index_status` returns
+an empty list), pass the project's absolute path as `workspace` on the call;
+it is opened and indexed on demand. Never pass the plugin folder itself.
+
+To search a second directory, call `open_workspace` with its absolute path,
+then pass `workspace` on later calls to choose which one answers.
