@@ -835,3 +835,37 @@ fn the_default_pairing_indexes_code_and_media_side_by_side() {
     assert_eq!(db.media_embedding_count().unwrap(), 2);
     assert_eq!(db.embedding_model().as_deref(), Some(gemma2::MODEL_ID));
 }
+
+/// The order the server works in: text first, on a model that is there in
+/// seconds; media when its model has arrived, which on a first run is
+/// minutes later. The pass that ran without the media model must not leave
+/// media pending, and the pass after it must embed the media and only that.
+#[test]
+fn media_is_embedded_by_a_later_pass_once_its_model_arrives() {
+    let models = models_root(&all_files());
+    let rt = runtime();
+    let ws = workspace();
+    let root = ws.path().to_string_lossy().to_string();
+    let db = IndexDb::open(&ws.path().join("index.db")).unwrap();
+    indexer::scan_workspace(&db, &root, None, None, None).unwrap();
+
+    let shared = rt
+        .block_on(embeddings::ensure_and_load(
+            models.path(),
+            ModelChoice::Auto,
+            MediaNeeds::NONE,
+        ))
+        .unwrap();
+    let (_, text) = indexer::generate_all_embeddings(&db, &shared, None, &root).unwrap();
+    assert!(text >= 1);
+    assert_eq!(db.media_embedding_count().unwrap(), 0);
+    assert_eq!(db.embedding_pending_files().unwrap(), 0);
+    assert_eq!(db.media_embedding_model(), None);
+
+    rt.block_on(embeddings::extend_media(&shared, BOTH));
+    let (_, media) = indexer::generate_all_embeddings(&db, &shared, None, &root).unwrap();
+    assert_eq!(media, 2, "the picture and the clip; no code again");
+    assert_eq!(db.media_embedding_count().unwrap(), 2);
+    assert_eq!(db.index_stats().unwrap().2, text + 2);
+    assert_eq!(db.embedding_pending_files().unwrap(), 0);
+}

@@ -57,8 +57,10 @@ grep as the fallback. Reach for grep when you need every textual occurrence
   (what the picture shows, what the clip sounds like); `lexical` means only
   its name or path did. Content matching needs the multimodal model, which
   is fetched (175 MB and up) the first time a workspace with images or audio
-  is opened: `index_status` reports, under `media`, its `model` and whether
-  the image and audio encoders are loaded. The list is absent when nothing
+  is opened, after code search is already up: `index_status` reports, under
+  `media`, a `state` (`loading` → `embedding` → `ready`, or `name-only` when
+  content matching is unavailable), the `model`, and whether the image and
+  audio encoders are loaded. The list is absent when nothing
   matches — most code questions.
 
 ## When the index is not ready

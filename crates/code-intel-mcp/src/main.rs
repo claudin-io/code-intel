@@ -165,7 +165,8 @@ fn embedding_model(ws: &Workspace) -> Option<String> {
 
 /// Images and audio in the index, how many have a content vector (the rest
 /// match by file name only), the model those vectors come from — it need not
-/// be the text one — and which of its encoders are loaded.
+/// be the text one — which of its encoders are loaded, and whether any of
+/// that is still on its way (`state`).
 fn media_status(ws: &Workspace) -> serde_json::Value {
     let (images, audio) = ws.db.media_file_counts().unwrap_or((0, 0));
     let (support, model) = ws
@@ -180,6 +181,7 @@ fn media_status(ws: &Workspace) -> serde_json::Value {
         "images": images,
         "audio": audio,
         "withContentVector": ws.db.media_embedding_count().unwrap_or(0),
+        "state": ws.media_stage().as_str(),
         "model": model.or_else(|| ws.db.media_embedding_model()),
         "imageEncoder": support.images,
         "audioEncoder": support.audio,
@@ -337,7 +339,7 @@ impl CodeIntel {
 impl CodeIntel {
     #[tool(
         name = "index_status",
-        description = "State of the local code index: phase (indexing | embedding | lexical_only | ready | failed), scan/embedding progress, counts of indexed files, symbols and embeddings, the embedding model in use, and how many image/audio files are indexed (with the model and encoders that describe their content, when loaded). Call this when a search tool says the index is not ready."
+        description = "State of the local code index: phase (indexing | embedding | lexical_only | ready | failed), scan/embedding progress, counts of indexed files, symbols and embeddings, the embedding model in use, and how many image/audio files are indexed (media.state: loading | embedding | ready when they are being given content vectors by the media model, name-only when they match by file name only). Call this when a search tool says the index is not ready."
     )]
     async fn index_status(
         &self,

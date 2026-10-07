@@ -114,9 +114,12 @@ clip). SVG is indexed as code; video and AAC/M4A audio are not indexed. Up to 20
 per workspace get a content vector — encoding one image is seconds of CPU — and the rest stay
 findable by name.
 
-Code search never depends on EmbeddingGemma 2. If it cannot be downloaded or loaded — or the
-build cannot run it at all — the server logs why, and images and audio are matched by file
-name instead of by content; nothing else changes.
+Code search never depends on EmbeddingGemma 2, and never waits for it: the code is embedded
+and searchable while the media model is still downloading, and images and audio get their
+content vectors afterwards (`index_status` → `media.state`: `loading`, `embedding`, `ready`).
+If the model cannot be downloaded or loaded — or the build cannot run it at all — the server
+logs why, and images and audio are matched by file name instead of by content (`name-only`);
+nothing else changes.
 
 EmbeddingGemma 2 also embeds text (code and prose in 100+ languages, where MiniLM is
 English-only), and `CODE_INTEL_MODEL=embeddinggemma2` uses it for everything. It is not the
