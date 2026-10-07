@@ -335,9 +335,9 @@ fn run_model(opts: &Options, eval: &EvalSet, choice: Option<ModelChoice>, report
     print_summary(&s, shared.is_some(), report);
 
     if shared.is_some() {
-        cosine_analysis(&db, eval, &pos_vecs, &neg_vecs, report);
+        let band = cosine_analysis(&db, eval, &pos_vecs, &neg_vecs, report);
         if opts.sweep {
-            sweep(&db, eval, &pos_vecs, &neg_vecs, &params, report);
+            sweep(&db, eval, &pos_vecs, &neg_vecs, &params, band, report);
         }
         if let Some(shared) = &shared {
             media_analysis(&db, eval, shared, report);
@@ -434,24 +434,47 @@ fn print_summary(s: &Summary, hybrid: bool, report: &mut Report) {
     report.line(dist("irrelevant score dist", &s.irrelevant_scores));
 }
 
+/// The cosine values a sweep tries: nine across the band where the gate can
+/// do anything — from the 90th percentile of unrelated chunks up to the upper
+/// quartile of the chunks queries are looking for — plus the gate in use.
+///
+/// Measured, not fixed, because models put their scores in different places:
+/// MiniLM's band is 0.20-0.59, EmbeddingGemma 2's is 0.71-0.83, and a fixed
+/// 0.20-0.60 grid run against the latter printed 54 identical rows.
+fn cosine_grid(band: Option<(f32, f32)>, in_use: f32) -> Vec<f32> {
+    const STEPS: usize = 9;
+    let (low, high) = match band {
+        Some((low, high)) if high > low => (low, high),
+        _ => (0.20, 0.60),
+    };
+    let mut grid: Vec<f32> = (0..STEPS)
+        .map(|i| low + (high - low) * i as f32 / (STEPS - 1) as f32)
+        .chain([in_use])
+        .map(|c| (c * 1000.0).round() / 1000.0)
+        .collect();
+    grid.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    grid.dedup();
+    grid
+}
+
 /// The decisive levers are the two gates (vector-leg cosine entry and the
 /// final hybrid score) plus the BM25 weight; rrf_k trades against
-/// min_hybrid_score on the same axis, so it stays at the default. The cosine
-/// grid is wide on purpose: where a model's scores sit is exactly what a
-/// first sweep of it has to find out.
+/// min_hybrid_score on the same axis, so it stays at the default.
 fn sweep(
     db: &IndexDb,
     eval: &EvalSet,
     pos_vecs: &[Option<Vec<f32>>],
     neg_vecs: &[Option<Vec<f32>>],
     base: &HybridParams,
+    band: Option<(f32, f32)>,
     report: &mut Report,
 ) {
+    let grid = cosine_grid(band, base.min_cosine_candidate);
     report.line("\n=== SWEEP ===");
     report.line("min_hyb  w_bm25  min_cos |  top1  top3  top15  neg  | exact-id top1");
     for min_hybrid_score in [0.35f32, 0.40, 0.45] {
         for w_bm25 in [0.7f32, 1.0] {
-            for min_cosine_candidate in [0.20f32, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60] {
+            for &min_cosine_candidate in &grid {
                 let params = HybridParams {
                     w_bm25,
                     min_hybrid_score,
@@ -497,13 +520,16 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// against the best chunk of the file it is looking for, against everything
 /// else, and what an off-topic query's best match looks like. The vector gate
 /// (`min_cosine_candidate`) belongs between the last two and under the first.
+///
+/// Returns the band a sweep of that gate should cover: the 90th percentile of
+/// unrelated chunks and the upper quartile of the sought ones.
 fn cosine_analysis(
     db: &IndexDb,
     eval: &EvalSet,
     pos_vecs: &[Option<Vec<f32>>],
     neg_vecs: &[Option<Vec<f32>>],
     report: &mut Report,
-) {
+) -> Option<(f32, f32)> {
     let rows: Vec<(String, Vec<f32>)> = db
         .load_all_embeddings()
         .expect("load embeddings")
@@ -512,7 +538,7 @@ fn cosine_analysis(
         .map(|(sym, _, _, v)| (basename(&sym.file_path.unwrap_or_default()), v))
         .collect();
     if rows.is_empty() {
-        return;
+        return None;
     }
     let mut relevant_best = Vec::new();
     let mut background = Vec::new();
@@ -549,15 +575,18 @@ fn cosine_analysis(
     report.line(dist("chunks of other files (sample) ", &background));
     report.line(dist("off-topic query, its best chunk", &negative_top));
     background.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    if !background.is_empty() {
-        let p = |q: f64| background[((background.len() - 1) as f64 * q) as usize];
-        report.line(format!(
-            "other-file chunks, upper tail: p90={:.3} p99={:.3} p99.9={:.3}",
-            p(0.90),
-            p(0.99),
-            p(0.999)
-        ));
+    relevant_best.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if background.is_empty() || relevant_best.is_empty() {
+        return None;
     }
+    let p = |q: f64| background[((background.len() - 1) as f64 * q) as usize];
+    report.line(format!(
+        "other-file chunks, upper tail: p90={:.3} p99={:.3} p99.9={:.3}",
+        p(0.90),
+        p(0.99),
+        p(0.999)
+    ));
+    Some((p(0.90), relevant_best[(relevant_best.len() - 1) * 3 / 4]))
 }
 
 /// Text queries against the workspace's image and audio vectors. Two

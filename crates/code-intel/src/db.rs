@@ -159,19 +159,39 @@ impl HybridParams {
     }
 }
 
-/// Vector gate for EmbeddingGemma 2. PROVISIONAL: the MiniLM value above came
-/// out of a sweep over real queries, this one did not — it is set a little
-/// under MiniLM's so the new model's vector leg is not starved before it has
-/// been measured. Run `semantic_eval --sweep` against this model and replace
-/// it with the measured value.
-const GEMMA2_MIN_COSINE_CANDIDATE: f32 = 0.35;
+/// Vector gate for EmbeddingGemma 2, whose cosines sit in a narrow, high band:
+/// nothing in a repository scores under 0.5 against anything, so a MiniLM-sized
+/// gate lets every chunk through and every off-topic query returns a full page.
+///
+/// Measured on Claudinio Code (15.7k chunks, 59 queries, 2026-10-07): a
+/// query's best chunk in the file it is looking for scores 0.730-0.869
+/// (p25 0.793); chunks of other files have p99 0.748 and p99.9 0.785; the
+/// best chunk for an off-topic query scores 0.735, 0.741, 0.749, 0.749 and
+/// 0.791. 0.75 is the 99th percentile of unrelated chunks and turns four of
+/// those five off-topic queries away at the vector leg, while sitting closer
+/// to the weakest relevant score than MiniLM's 0.40 does on its own scale.
+///
+/// Chosen from those distributions. The sweep of that run stopped at 0.60, so
+/// ranking with this gate has not been measured yet: `semantic_eval --sweep`
+/// now sweeps the band the model's scores actually occupy — re-run it with
+/// EmbeddingGemma 2 as the text model before moving this.
+const GEMMA2_MIN_COSINE_CANDIDATE: f32 = 0.75;
 
 /// Gate for an image or audio vector against a text query. Scores across
-/// modalities sit on their own scale: in the model's published example the
-/// right picture, clip and video score 0.73-0.76 against their query and the
-/// wrong ones 0.46-0.51. This is the midpoint, and PROVISIONAL in the same
-/// sense as the constant above.
-pub const MEDIA_MIN_COSINE: f32 = 0.60;
+/// modalities sit on their own scale, and an unrelated picture is never far
+/// from a query: on Claudinio Code (18 images, 2026-10-07) the best image for
+/// each of 64 code queries scored 0.568-0.687 (median 0.621), so the 0.60
+/// this started at would have put an unrelated file under `media` for 54 of
+/// them. The two queries that describe an image scored 0.707 and 0.760 on it
+/// and 0.586 and 0.578 on the best other one. 0.70 is over every code query
+/// and under both descriptions — by a narrow margin, on two queries: a
+/// description that matches loosely falls back to the file-name match.
+///
+/// Audio has no such measurement: that workspace has no sound files. The only
+/// numbers are `gemma2_e2e`'s two synthetic clips, whose descriptions scored
+/// 0.733 and 0.686 on the right clip and 0.704 and 0.630 on the wrong one —
+/// no gate separates those, and real recordings may sit elsewhere.
+pub const MEDIA_MIN_COSINE: f32 = 0.70;
 
 impl Default for HybridParams {
     // Calibrated with `semantic_eval --sweep` on 2026-07-20 (59 positives /

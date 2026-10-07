@@ -123,9 +123,18 @@ nothing else changes.
 
 EmbeddingGemma 2 also embeds text (code and prose in 100+ languages, where MiniLM is
 English-only), and `CODE_INTEL_MODEL=embeddinggemma2` uses it for everything. It is not the
-default because its weights are eight times MiniLM's and indexing a repository takes
-correspondingly longer; see [Evaluating a model](#evaluating-a-model) for how to measure both
-on your own code.
+default because of what indexing with it costs. Measured on the 15.7k chunks of
+[Claudinio Code](https://github.com/claudin-io/claudinio-code), on a GitHub-hosted Linux
+runner (CPU only):
+
+| | all-MiniLM-L6-v2 | EmbeddingGemma 2 |
+|---|---|---|
+| First index | 4 min (66 chunks/s) | 2 h 21 min (1.8 chunks/s) |
+| Encoding a query | 14 ms | 49 ms |
+| Expected file ranked first / in the top 3 / in the top 15 (59 queries) | 62% / 84% / 100% | 69% / 86% / 98% |
+
+Four more queries answered at rank one, for thirty-six times the indexing time. See
+[Evaluating a model](#evaluating-a-model) to measure both on your own code.
 
 An index records which model wrote its text vectors and which wrote its media vectors. When
 one of them changes, that kind of file is re-embedded in the background and the other kind is
@@ -138,8 +147,9 @@ left alone; vectors of two models are never mixed. `index_status` shows both.
 > `cargo test -p claudinio-code-intel --test gemma2_e2e -- --ignored --nocapture` (does it rank
 > code, images and audio sensibly at all) and the eval below. The two search thresholds
 > specific to EmbeddingGemma 2 (`GEMMA2_MIN_COSINE_CANDIDATE`, `MEDIA_MIN_COSINE` in `db.rs`)
-> are provisional until that eval has been run against it — MiniLM's came out of a sweep over
-> real queries, these have not yet.
+> are set from that eval's score distributions on one repository. The media threshold rests on
+> 18 images, two descriptive queries and no real audio; the text one, which only applies under
+> `CODE_INTEL_MODEL=embeddinggemma2`, has not had its effect on ranking swept yet.
 
 ### Evaluating a model
 
