@@ -6,10 +6,13 @@
 //! BM25 and vector ranks with reciprocal rank fusion. Code is never sent
 //! anywhere to be indexed.
 //!
-//! Text is embedded with all-MiniLM-L6-v2 in every build. In the ONNX Runtime
-//! build, a workspace with images or audio also gets EmbeddingGemma 2
-//! (`gemma2`), which places those in one space with the queries that
-//! describe them; it can be made the text model as well
+//! Text is embedded with all-MiniLM-L6-v2 in every build: search works
+//! minutes after a workspace is opened. The ONNX Runtime build also has
+//! EmbeddingGemma 2 (`gemma2`), slower by a factor of thirty and somewhat
+//! better. It embeds a workspace's images and audio, in one space with the
+//! queries that describe them, and it embeds the text a second time in the
+//! background — the index's upgrade set (`db::VectorSet`), which search moves
+//! to once it is complete. It can also be made the text model outright
 //! (`embeddings::ModelChoice`). `media` lists a workspace's images and audio;
 //! `media_prep` decodes them for the encoders.
 //!
@@ -36,3 +39,10 @@ pub mod watcher;
 /// Only one workspace indexes at a time: parallel scans + embedding runs peg
 /// every core and hammer slow/network drives.
 pub static INDEX_SEMAPHORE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Only one workspace at a time has its upgrade set filled in
+/// (`indexer::generate_upgrade_embeddings`): that pass is the heaviest thing
+/// this crate does, by far, and two of them would halve each other. It is
+/// deliberately not `INDEX_SEMAPHORE` — holding that for an hour would keep
+/// the watcher, and the first index of every other workspace, waiting.
+pub static UPGRADE_SEMAPHORE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);

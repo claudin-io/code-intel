@@ -349,9 +349,9 @@ impl MiniLmEmbedder {
             // Cap ONNX threading: the default (one intra-op thread per
             // physical core) saturates the whole machine during indexing and
             // starves the WebView UI thread — Windows then flags the window
-            // as "Not responding". Embedding is background work; keep it slow
-            // and polite. `CODE_INTEL_THREADS` raises the cap where there is
-            // no UI to starve.
+            // as "Not responding". Embedding is background work: it gets
+            // half the cores at most (`intra_threads`), or whatever
+            // `CODE_INTEL_THREADS` says.
             .with_intra_threads(intra_threads())
             .map_err(|e| format!("ort intra threads: {e}"))?
             .with_inter_threads(1)
@@ -911,20 +911,45 @@ pub async fn ensure_model_downloaded(cache_dir: &Path) -> Result<(), String> {
 
 // ── the embedder the rest of the crate talks to ─────────────────────────
 
-/// Threads one model run may use. Two by default — indexing is a background
-/// job, and in Claudinio Code it shares the machine with a UI. A headless
-/// server on a many-core machine can afford more: `CODE_INTEL_THREADS`.
-pub const DEFAULT_INTRA_THREADS: usize = 2;
-
-pub fn intra_threads() -> usize {
-    parse_threads(std::env::var("CODE_INTEL_THREADS").ok().as_deref())
+/// Threads one model run may use when `CODE_INTEL_THREADS` does not say: half
+/// the machine's physical cores, never fewer than two nor more than eight.
+///
+/// Indexing is a background job on a machine someone is working at, so it
+/// never takes every core — one thread per physical core starved the UI
+/// thread of the app this crate came from. But a fixed two left a ten-core
+/// laptop idle while its first index took far longer than it had to:
+/// measured on one, EmbeddingGemma 2 embeds 2.0 chunks a second on two
+/// threads, 3.9 on four and 6.6 on eight.
+///
+/// The system reports logical processors. On x86 those are taken to be two
+/// to a core, which is what nearly every desktop and laptop x86 chip has; a
+/// chip without hyper-threading gets a more cautious number than it needs.
+pub fn default_intra_threads() -> usize {
+    threads_for_logical_cpus(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2),
+        cfg!(any(target_arch = "x86", target_arch = "x86_64")),
+    )
 }
 
-fn parse_threads(value: Option<&str>) -> usize {
+fn threads_for_logical_cpus(logical: usize, two_per_core: bool) -> usize {
+    let cores = if two_per_core { logical / 2 } else { logical };
+    (cores / 2).clamp(2, 8)
+}
+
+pub fn intra_threads() -> usize {
+    parse_threads(
+        std::env::var("CODE_INTEL_THREADS").ok().as_deref(),
+        default_intra_threads(),
+    )
+}
+
+fn parse_threads(value: Option<&str>, default: usize) -> usize {
     value
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| (1..=64).contains(n))
-        .unwrap_or(DEFAULT_INTRA_THREADS)
+        .unwrap_or(default)
 }
 
 /// How MiniLM vectors are labelled in an index (see
@@ -937,7 +962,7 @@ pub const MINILM_DIM: usize = 384;
 enum Engine {
     MiniLm(Box<MiniLmEmbedder>),
     #[cfg(feature = "embeddings")]
-    Gemma2(Box<crate::gemma2::Gemma2Embedder>),
+    Gemma2(std::sync::Arc<crate::gemma2::Gemma2Embedder>),
 }
 
 /// The models an embedder writes an index with: one for text and, where
@@ -980,31 +1005,38 @@ impl ModelProfile {
 
 /// The embedding models this process ended up with.
 ///
-/// Text and media are two roles. Every build has MiniLM for text: 384
-/// dimensions, 23 MB. The ONNX Runtime build can also run EmbeddingGemma 2,
-/// which places text, images and audio in one space but costs far more per
-/// chunk of text. By default it is therefore brought in for media only, next
-/// to MiniLM, and only once a workspace with media shows up — a text-only
-/// project downloads and runs exactly what it always did.
-/// `CODE_INTEL_MODEL=embeddinggemma2` makes it the text model as well.
+/// Every build has MiniLM for text: 384 dimensions, 23 MB, a repository
+/// embedded in minutes. The ONNX Runtime build can also run EmbeddingGemma 2,
+/// which places text, images and audio in one space and ranks text somewhat
+/// better, but takes some thirty times as long per chunk. So by default it
+/// never stands between a workspace and its first search: MiniLM writes the
+/// index, and EmbeddingGemma 2 is brought in beside it — as the *companion* —
+/// for the two things it is worth waiting for. One is media, in a workspace
+/// that has any. The other is the text upgrade: the same chunks embedded
+/// again in the background, searched instead of MiniLM's once they are all
+/// there (`db::VectorSet`).
+/// `CODE_INTEL_MODEL=embeddinggemma2` makes it the text model outright.
 ///
 /// Callers do not branch on any of this: the index records which model each
-/// kind of vector came from (`profile`), and media calls simply report that
-/// there is nothing loaded that can do them.
+/// kind of vector came from (`profile`), and media and upgrade calls simply
+/// report that there is nothing loaded that can do them.
 pub struct CodeEmbedder {
     engine: Engine,
-    /// EmbeddingGemma 2 beside a MiniLM text engine, used for media and for
-    /// the queries compared against media. Unused when it is the text engine.
+    /// EmbeddingGemma 2 beside a MiniLM text engine. Unused when it is the
+    /// text engine. Shared, with its own lock around each run, so a
+    /// background pass through it never holds this embedder's lock — which
+    /// every MiniLM query needs.
     #[cfg(feature = "embeddings")]
-    media_engine: Option<Box<crate::gemma2::Gemma2Embedder>>,
-    /// Where that engine's files live, when this embedder is allowed to grow
-    /// one (`extend_media`). `None`: never — MiniLM was asked for by name, or
-    /// loading it already failed in this process.
+    companion: Option<std::sync::Arc<crate::gemma2::Gemma2Embedder>>,
+    /// Where the companion's files live, when this embedder is allowed to
+    /// grow one. `None`: never — MiniLM was asked for by name, or loading it
+    /// already failed in this process.
     #[cfg(feature = "embeddings")]
-    media_home: Option<std::path::PathBuf>,
+    companion_home: Option<std::path::PathBuf>,
 }
 
 const NO_MEDIA: &str = "no loaded model has an encoder for this kind of file";
+const NO_UPGRADE: &str = "EmbeddingGemma 2 is not loaded beside the text model";
 
 impl CodeEmbedder {
     /// MiniLM from `model_dir` — what this function has always loaded.
@@ -1012,9 +1044,9 @@ impl CodeEmbedder {
         Ok(CodeEmbedder {
             engine: Engine::MiniLm(Box::new(MiniLmEmbedder::load(model_dir)?)),
             #[cfg(feature = "embeddings")]
-            media_engine: None,
+            companion: None,
             #[cfg(feature = "embeddings")]
-            media_home: None,
+            companion_home: None,
         })
     }
 
@@ -1023,33 +1055,26 @@ impl CodeEmbedder {
     #[cfg(feature = "embeddings")]
     pub fn load_gemma2(model_dir: &Path) -> Result<Self, String> {
         Ok(CodeEmbedder {
-            engine: Engine::Gemma2(Box::new(crate::gemma2::Gemma2Embedder::load(model_dir)?)),
-            media_engine: None,
-            media_home: None,
+            engine: Engine::Gemma2(std::sync::Arc::new(crate::gemma2::Gemma2Embedder::load(model_dir)?)),
+            companion: None,
+            companion_home: None,
         })
     }
 
-    /// Let `extend_media` add EmbeddingGemma 2 as this embedder's media
-    /// engine, downloading it into `gemma2_dir`, when a workspace needs it.
+    /// Let EmbeddingGemma 2 join this embedder as its companion, downloaded
+    /// into `gemma2_dir`, when something needs it (`extend_media`,
+    /// `ensure_text_upgrade`).
     #[cfg(feature = "embeddings")]
-    pub fn allow_media_engine(&mut self, gemma2_dir: &Path) {
-        self.media_home = Some(gemma2_dir.to_path_buf());
+    pub fn allow_companion(&mut self, gemma2_dir: &Path) {
+        self.companion_home = Some(gemma2_dir.to_path_buf());
     }
 
     /// EmbeddingGemma 2, in whichever role it is loaded.
     #[cfg(feature = "embeddings")]
-    fn gemma2(&self) -> Option<&crate::gemma2::Gemma2Embedder> {
+    fn gemma2(&self) -> Option<&std::sync::Arc<crate::gemma2::Gemma2Embedder>> {
         match &self.engine {
             Engine::Gemma2(g) => Some(g),
-            Engine::MiniLm(_) => self.media_engine.as_deref(),
-        }
-    }
-
-    #[cfg(feature = "embeddings")]
-    fn gemma2_mut(&mut self) -> Option<&mut crate::gemma2::Gemma2Embedder> {
-        match &mut self.engine {
-            Engine::Gemma2(g) => Some(g),
-            Engine::MiniLm(_) => self.media_engine.as_deref_mut(),
+            Engine::MiniLm(_) => self.companion.as_ref(),
         }
     }
 
@@ -1078,6 +1103,24 @@ impl CodeEmbedder {
         #[cfg(feature = "embeddings")]
         {
             self.gemma2()
+                .map(|_| (crate::gemma2::MODEL_ID, crate::gemma2::EMBED_DIM))
+        }
+        #[cfg(not(feature = "embeddings"))]
+        {
+            None
+        }
+    }
+
+    /// Id and vector length of the model that writes and queries an index's
+    /// upgrade set: the companion of a MiniLM text model, once loaded. `None`
+    /// when EmbeddingGemma 2 is the text model itself — there is nothing to
+    /// upgrade to — and in builds that cannot run it.
+    pub fn upgrade_model(&self) -> Option<(&'static str, usize)> {
+        #[cfg(feature = "embeddings")]
+        {
+            self.companion
+                .as_ref()
+                .filter(|_| matches!(self.engine, Engine::MiniLm(_)))
                 .map(|_| (crate::gemma2::MODEL_ID, crate::gemma2::EMBED_DIM))
         }
         #[cfg(not(feature = "embeddings"))]
@@ -1115,11 +1158,12 @@ impl CodeEmbedder {
     }
 
     /// Embed a search query to compare against image and audio vectors.
-    /// `None` when no loaded model shares a space with media.
+    /// `None` when no loaded model shares a space with media. Holds this
+    /// embedder for the run; `embeddings::encode_media_query` does not.
     pub fn encode_media_query(&mut self, text: &str) -> Result<Option<Vec<f32>>, String> {
         #[cfg(feature = "embeddings")]
         {
-            match self.gemma2_mut() {
+            match self.gemma2() {
                 Some(g) => g.encode_query(text, crate::gemma2::QueryTask::Media).map(Some),
                 None => Ok(None),
             }
@@ -1149,7 +1193,7 @@ impl CodeEmbedder {
     pub fn embed_media_file(&mut self, path: &Path, kind: MediaKind) -> Result<Vec<f32>, String> {
         #[cfg(feature = "embeddings")]
         {
-            let Some(g) = self.gemma2_mut().filter(|g| g.media_support().has(kind)) else {
+            let Some(g) = self.gemma2().filter(|g| g.media_support().has(kind)) else {
                 return Err(NO_MEDIA.into());
             };
             let soft = crate::gemma2::encode_media_file(&g.encoders(), path, kind)?;
@@ -1171,26 +1215,95 @@ pub fn load_shared(cache_dir: &Path) -> Result<SharedEmbedder, String> {
     Ok(std::sync::Arc::new(std::sync::Mutex::new(embedder)))
 }
 
+/// EmbeddingGemma 2 out of a shared embedder, in whichever role it is loaded
+/// — to be run without the embedder's lock.
+#[cfg(feature = "embeddings")]
+fn gemma2_of(shared: &SharedEmbedder) -> Result<Option<std::sync::Arc<crate::gemma2::Gemma2Embedder>>, String> {
+    Ok(shared
+        .lock()
+        .map_err(|e| format!("embedder lock poisoned: {e}"))?
+        .gemma2()
+        .cloned())
+}
+
+/// The companion of a shared MiniLM embedder: the engine of the upgrade set.
+#[cfg(feature = "embeddings")]
+fn upgrade_engine(shared: &SharedEmbedder) -> Result<std::sync::Arc<crate::gemma2::Gemma2Embedder>, String> {
+    let guard = shared
+        .lock()
+        .map_err(|e| format!("embedder lock poisoned: {e}"))?;
+    match (&guard.engine, &guard.companion) {
+        (Engine::MiniLm(_), Some(g)) => Ok(g.clone()),
+        _ => Err(NO_UPGRADE.into()),
+    }
+}
+
+/// Embed a search query against the primary text vectors of an index.
+pub fn encode_query(shared: &SharedEmbedder, text: &str) -> Result<Vec<f32>, String> {
+    shared
+        .lock()
+        .map_err(|e| format!("embedder lock poisoned: {e}"))?
+        .encode_query(text)
+}
+
+/// Embed a search query to compare against image and audio vectors; `None`
+/// when no loaded model shares a space with media. The embedder's lock is
+/// held only to find the model, not while it runs.
+pub fn encode_media_query(shared: &SharedEmbedder, text: &str) -> Result<Option<Vec<f32>>, String> {
+    #[cfg(feature = "embeddings")]
+    {
+        match gemma2_of(shared)? {
+            Some(g) => g.encode_query(text, crate::gemma2::QueryTask::Media).map(Some),
+            None => Ok(None),
+        }
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = (shared, text);
+        Ok(None)
+    }
+}
+
+/// Embed index texts for the upgrade set (see `CodeEmbedder::upgrade_model`).
+/// Seconds per batch — and none of them under the embedder's lock, so MiniLM
+/// queries and the file watcher carry on meanwhile.
+pub fn encode_upgrade_documents(shared: &SharedEmbedder, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+    #[cfg(feature = "embeddings")]
+    {
+        upgrade_engine(shared)?.encode_documents(texts)
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = (shared, texts);
+        Err(NO_UPGRADE.into())
+    }
+}
+
+/// Embed a search query to compare against the upgrade set.
+pub fn encode_upgrade_query(shared: &SharedEmbedder, text: &str) -> Result<Vec<f32>, String> {
+    #[cfg(feature = "embeddings")]
+    {
+        upgrade_engine(shared)?.encode_query(text, crate::gemma2::QueryTask::Code)
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = (shared, text);
+        Err(NO_UPGRADE.into())
+    }
+}
+
 /// Embed one media file with a shared embedder. Decoding and the encoder run
-/// — seconds for an image — happen outside the embedder's lock, which is
-/// taken only for the short text-model pass at the end, so a search issued
-/// meanwhile is not held up.
+/// — seconds for an image — and the text-model pass at the end all happen
+/// outside the embedder's lock, so a search issued meanwhile is not held up.
 pub fn embed_media_file(shared: &SharedEmbedder, path: &Path, kind: MediaKind) -> Result<Vec<f32>, String> {
     #[cfg(feature = "embeddings")]
     {
-        let encoders = {
-            let guard = shared.lock().map_err(|e| format!("embedder lock poisoned: {e}"))?;
-            match guard.gemma2() {
-                Some(g) if g.media_support().has(kind) => g.encoders(),
-                _ => return Err(NO_MEDIA.into()),
-            }
+        let engine = match gemma2_of(shared)? {
+            Some(g) if g.media_support().has(kind) => g,
+            _ => return Err(NO_MEDIA.into()),
         };
-        let soft = crate::gemma2::encode_media_file(&encoders, path, kind)?;
-        let mut guard = shared.lock().map_err(|e| format!("embedder lock poisoned: {e}"))?;
-        match guard.gemma2_mut() {
-            Some(g) => g.embed_soft_tokens(kind, &soft),
-            None => Err(NO_MEDIA.into()),
-        }
+        let soft = crate::gemma2::encode_media_file(&engine.encoders(), path, kind)?;
+        engine.embed_soft_tokens(kind, &soft)
     }
     #[cfg(not(feature = "embeddings"))]
     {
@@ -1202,10 +1315,11 @@ pub fn embed_media_file(shared: &SharedEmbedder, path: &Path, kind: MediaKind) -
 /// Which models to use. `CODE_INTEL_MODEL` sets it; the default is `Auto`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelChoice {
-    /// MiniLM for text. EmbeddingGemma 2 for images and audio, where this
-    /// build can run it and the workspace has any — if it cannot be
-    /// downloaded or loaded, media stays findable by file name and nothing
-    /// else changes.
+    /// MiniLM for text, at once. Where this build can run EmbeddingGemma 2:
+    /// that model for images and audio, if the workspace has any, and for
+    /// the text upgrade in the background. If it cannot be downloaded or
+    /// loaded, media stays findable by file name, text search stays on
+    /// MiniLM and nothing else changes.
     Auto,
     /// MiniLM and nothing else: the behaviour before EmbeddingGemma 2
     /// existed.
@@ -1235,6 +1349,15 @@ impl ModelChoice {
             Err(_) => ModelChoice::Auto,
         }
     }
+}
+
+/// Whether the text upgrade is wanted at all: `CODE_INTEL_UPGRADE=0` keeps
+/// text search on the primary model for good — no second download, no hours
+/// of background work — while media keeps its model.
+pub fn text_upgrade_enabled() -> bool {
+    std::env::var("CODE_INTEL_UPGRADE")
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true)
 }
 
 /// Whether this binary can run EmbeddingGemma 2 at all.
@@ -1292,36 +1415,38 @@ pub struct LoadPlan {
     /// The text model. `None`: this build cannot honour the choice, and an
     /// explicit choice is never swapped for another model.
     pub text: Option<ModelFamily>,
-    /// Whether EmbeddingGemma 2 may join a MiniLM text model as the media
-    /// engine. (As the text model it is the media engine already.)
-    pub media_engine: bool,
+    /// Whether EmbeddingGemma 2 may join a MiniLM text model as its
+    /// companion: for media and for the text upgrade. (As the text model it
+    /// does both jobs already.)
+    pub companion: bool,
 }
 
 /// The whole model policy. Text search never depends on EmbeddingGemma 2
-/// unless it was asked for by name: under `Auto` it is an addition for media,
-/// and every way it can be missing — a build without ONNX Runtime, a failed
-/// download, a graph the runtime rejects — leaves text search as it was.
+/// unless it was asked for by name: under `Auto` it is an addition, and every
+/// way it can be missing — a build without ONNX Runtime, a failed download, a
+/// graph the runtime rejects — leaves text search as it was.
 pub fn load_plan(choice: ModelChoice, gemma2_supported: bool) -> LoadPlan {
     match choice {
         ModelChoice::Auto => LoadPlan {
             text: Some(ModelFamily::MiniLm),
-            media_engine: gemma2_supported,
+            companion: gemma2_supported,
         },
         ModelChoice::MiniLm => LoadPlan {
             text: Some(ModelFamily::MiniLm),
-            media_engine: false,
+            companion: false,
         },
         ModelChoice::Gemma2 => LoadPlan {
             text: gemma2_supported.then_some(ModelFamily::Gemma2),
-            media_engine: false,
+            companion: false,
         },
     }
 }
 
 /// Download (as needed) and load the embedder for a workspace with the given
-/// media. The text model is fetched in every case; EmbeddingGemma 2 as media
-/// engine, and each of its encoders, only when `needs` says the workspace
-/// holds that kind of file.
+/// media. The text model is fetched in every case; EmbeddingGemma 2 as
+/// companion, and each of its encoders, only when `needs` says the workspace
+/// holds that kind of file. (The text upgrade asks for the companion on its
+/// own, later: `ensure_text_upgrade`.)
 pub async fn ensure_and_load(
     models_root: &Path,
     choice: ModelChoice,
@@ -1343,9 +1468,9 @@ pub async fn ensure_and_load(
         Some(ModelFamily::MiniLm) => {
             let shared = load_minilm(models_root).await?;
             #[cfg(feature = "embeddings")]
-            if plan.media_engine {
+            if plan.companion {
                 if let Ok(mut guard) = shared.lock() {
-                    guard.allow_media_engine(&models_root.join(crate::gemma2::CACHE_DIRNAME));
+                    guard.allow_companion(&models_root.join(crate::gemma2::CACHE_DIRNAME));
                 }
                 extend_media(&shared, needs).await;
             }
@@ -1355,24 +1480,24 @@ pub async fn ensure_and_load(
     }
 }
 
-/// Load EmbeddingGemma 2 as the media engine of a MiniLM embedder that is
-/// allowed one and has none yet. Best-effort, like everything about media.
+/// Load EmbeddingGemma 2 as the companion of a MiniLM embedder that is
+/// allowed one and has none yet. Best-effort, like everything it is for.
 #[cfg(feature = "embeddings")]
-async fn attach_media_engine(shared: &SharedEmbedder) {
+async fn attach_companion(shared: &SharedEmbedder) {
     let home = {
         let Ok(guard) = shared.lock() else { return };
         if guard.gemma2().is_some() {
             return;
         }
-        match &guard.media_home {
+        match &guard.companion_home {
             Some(home) => home.clone(),
             None => return,
         }
     };
-    const BY_NAME: &str = "images and audio stay findable by file name";
+    const WITHOUT: &str = "images and audio stay findable by file name, and text search stays on the first model";
     if let Err(e) = crate::gemma2::ensure_component_downloaded(&home, None).await {
         // Not remembered: the next workspace opened may find the network back.
-        eprintln!("[embeddings] EmbeddingGemma 2 download failed; {BY_NAME}: {e}");
+        eprintln!("[embeddings] EmbeddingGemma 2 download failed; {WITHOUT}: {e}");
         return;
     }
     let dir = home.clone();
@@ -1380,11 +1505,10 @@ async fn attach_media_engine(shared: &SharedEmbedder) {
     let Ok(mut guard) = shared.lock() else { return };
     let failure = match loaded {
         Ok(Ok(engine)) => {
-            // Two workspaces opening at once may both get here; one engine
-            // is enough.
+            // Two callers may both get here; one engine is enough.
             if guard.gemma2().is_none() {
-                guard.media_engine = Some(Box::new(engine));
-                eprintln!("[embeddings] EmbeddingGemma 2 ready for images and audio");
+                guard.companion = Some(std::sync::Arc::new(engine));
+                eprintln!("[embeddings] EmbeddingGemma 2 ready beside the text model");
             }
             return;
         }
@@ -1393,13 +1517,34 @@ async fn attach_media_engine(shared: &SharedEmbedder) {
     };
     // Remembered: the files were hash-checked, so this runtime cannot run
     // the graph and trying again for every workspace would not change that.
-    guard.media_home = None;
-    eprintln!("[embeddings] EmbeddingGemma 2 failed to load; {BY_NAME}: {failure}");
+    guard.companion_home = None;
+    eprintln!("[embeddings] EmbeddingGemma 2 failed to load; {WITHOUT}: {failure}");
+}
+
+/// Bring EmbeddingGemma 2 in beside a MiniLM embedder for the text upgrade,
+/// downloading its text model (175 MB) on first use. Returns whether the
+/// embedder can now write and query an upgrade set; `false` is every way it
+/// cannot — a choice or a build that rules it out, a failed download, a
+/// graph the runtime rejects — and costs nothing but the upgrade.
+pub async fn ensure_text_upgrade(shared: &SharedEmbedder) -> bool {
+    #[cfg(feature = "embeddings")]
+    {
+        attach_companion(shared).await;
+        shared
+            .lock()
+            .map(|guard| guard.upgrade_model().is_some())
+            .unwrap_or(false)
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = shared;
+        false
+    }
 }
 
 /// Give an already-loaded embedder what `needs` asks for and it lacks — a
 /// workspace with images joining a process that started on a text-only one:
-/// the media engine itself, if text is on MiniLM, and then the encoders.
+/// the companion itself, if text is on MiniLM, and then the encoders.
 /// Best-effort: whatever fails leaves that kind of media findable by file
 /// name only, and everything else as it was.
 pub async fn extend_media(shared: &SharedEmbedder, needs: MediaNeeds) {
@@ -1408,7 +1553,7 @@ pub async fn extend_media(shared: &SharedEmbedder, needs: MediaNeeds) {
         if !needs.any() {
             return;
         }
-        attach_media_engine(shared).await;
+        attach_companion(shared).await;
         for kind in MediaKind::ALL {
             if !needs.has(kind) {
                 continue;
@@ -1459,14 +1604,14 @@ pub async fn extend_media(shared: &SharedEmbedder, needs: MediaNeeds) {
 mod tests {
     use super::*;
 
-    /// The model policy, for every choice in both kinds of build. Text is
-    /// MiniLM unless EmbeddingGemma 2 is asked for by name; the media engine
-    /// is offered only by default and only where the build can run it; and an
-    /// explicit choice is never swapped for the other model.
+    /// The model policy, for every choice in both kinds of build. Text starts
+    /// on MiniLM unless EmbeddingGemma 2 is asked for by name; that model is
+    /// offered as companion only by default and only where the build can run
+    /// it; and an explicit choice is never swapped for the other model.
     #[test]
     fn text_stays_on_minilm_unless_gemma2_is_asked_for_by_name() {
         use ModelFamily::*;
-        let plan = |text, media_engine| LoadPlan { text, media_engine };
+        let plan = |text, companion| LoadPlan { text, companion };
         assert_eq!(load_plan(ModelChoice::Auto, true), plan(Some(MiniLm), true));
         assert_eq!(load_plan(ModelChoice::Auto, false), plan(Some(MiniLm), false));
         assert_eq!(load_plan(ModelChoice::MiniLm, true), plan(Some(MiniLm), false));
@@ -1476,18 +1621,34 @@ mod tests {
         // This build's own answer: the candle and no-backend builds must not
         // even try the ONNX-only model.
         let here = load_plan(ModelChoice::Auto, gemma2_supported());
-        assert_eq!(here.media_engine, cfg!(feature = "embeddings"));
+        assert_eq!(here.companion, cfg!(feature = "embeddings"));
         assert_eq!(here.text, Some(MiniLm));
     }
 
     #[test]
-    fn thread_cap_defaults_to_two_and_ignores_nonsense() {
-        assert_eq!(parse_threads(None), 2);
-        assert_eq!(parse_threads(Some("8")), 8);
-        assert_eq!(parse_threads(Some(" 4 ")), 4);
+    fn thread_cap_is_what_was_asked_for_and_ignores_nonsense() {
+        assert_eq!(parse_threads(None, 3), 3);
+        assert_eq!(parse_threads(Some("8"), 3), 8);
+        assert_eq!(parse_threads(Some(" 4 "), 3), 4);
         for bad in ["0", "-1", "many", "", "1000"] {
-            assert_eq!(parse_threads(Some(bad)), 2, "{bad:?}");
+            assert_eq!(parse_threads(Some(bad), 3), 3, "{bad:?}");
         }
+    }
+
+    /// Half the machine's cores, so the other half stays with whoever is
+    /// using it — but never one thread, and never a whole server's worth.
+    #[test]
+    fn the_default_thread_cap_follows_the_machine() {
+        // Processors that are cores (Apple silicon, most ARM).
+        for (cpus, threads) in [(1, 2), (2, 2), (4, 2), (6, 3), (8, 4), (10, 5), (16, 8), (64, 8)] {
+            assert_eq!(threads_for_logical_cpus(cpus, false), threads, "{cpus} cores");
+        }
+        // Processors that are halves of cores (x86 with hyper-threading): a
+        // 4-core/8-thread laptop keeps the two threads it always had.
+        for (cpus, threads) in [(4, 2), (8, 2), (12, 3), (16, 4), (32, 8), (128, 8)] {
+            assert_eq!(threads_for_logical_cpus(cpus, true), threads, "{cpus} logical");
+        }
+        assert!((2..=8).contains(&default_intra_threads()));
     }
 
     #[test]

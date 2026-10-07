@@ -7,9 +7,9 @@ extracted into an MCP server so any agent can use it:
 
 - **tree-sitter symbols** for 77 languages — functions, classes, methods, types, imports, and the call relations between them
 - **BM25 full-text** (SQLite FTS5) over symbol names, signatures, code bodies, docs and paths
-- **embeddings** of every chunk (all-MiniLM-L6-v2, 23 MB)
+- **embeddings** of every chunk: all-MiniLM-L6-v2 (23 MB) within minutes, then [EmbeddingGemma 2](#embedding-models) taking over in the background
 - **hybrid ranking**: reciprocal-rank fusion of the two, so an exact identifier and a description of behaviour both work
-- **images and audio** of the project, findable by what they show or sound like ([EmbeddingGemma 2](#embedding-models), fetched only for projects that have any) and always by file name
+- **images and audio** of the project, findable by what they show or sound like (EmbeddingGemma 2 again) and always by file name
 - a **file watcher** keeps the index current as you edit
 
 Everything runs on your machine. The index and the model live in your OS
@@ -24,7 +24,7 @@ cache directory, never inside the repository, and no code is sent anywhere.
 | `symbol_lookup` | exact symbol name |
 | `file_outline` | every symbol in a file with line ranges — read this before the file |
 | `find_callers` | who calls a symbol (from recorded call relations) |
-| `index_status` | phase and progress, the embedding models in use, media counts; the first scan takes seconds, embeddings a few minutes in the background |
+| `index_status` | phase and progress, the embedding model search is using, how far the background upgrade has got, media counts; the first scan takes seconds, embeddings a few minutes in the background |
 | `open_workspace` | index another directory |
 
 A `code-intel` skill ships with the plugin and teaches the agent when to
@@ -97,48 +97,69 @@ EmbeddingGemma 2 is published as ONNX graphs, which candle cannot load.
 
 ## Embedding models
 
-Text and media are embedded by two models, and the second one is optional.
+Two models, and neither is waited for.
 
 | | all-MiniLM-L6-v2 | EmbeddingGemma 2 |
 |---|---|---|
-| Embeds | code and docs | images and audio — and the queries compared against them |
-| Used by | every build | ONNX Runtime builds, for workspaces that contain images or audio |
+| Role | the first index: code and docs searchable within minutes | the upgrade: the same code and docs again, in the background; and images and audio |
+| Used by | every build | ONNX Runtime builds |
 | Vectors | 384-d | 768-d |
-| Download | 23 MB | nothing for a text-only project; otherwise 175 MB, **plus 109 MB if the workspace has images, plus 189 MB if it has audio** |
+| Download | 23 MB | 175 MB, **plus 109 MB if the workspace has images, plus 189 MB if it has audio** |
+| Languages | English | 100+ |
 
-What to fetch is decided per workspace from the files it actually contains (`.gitignore`
-respected). A project with no images and no audio downloads and runs exactly what it did
-before EmbeddingGemma 2 existed; one with screenshots but no sounds never fetches the audio
-encoder. Images are `png jpg jpeg webp gif bmp`; audio is `wav mp3 flac ogg` (first 30 s of a
-clip). SVG is indexed as code; video and AAC/M4A audio are not indexed. Up to 200 media files
-per workspace get a content vector — encoding one image is seconds of CPU — and the rest stay
-findable by name.
+**MiniLM first.** A workspace is scanned in seconds and embedded with MiniLM in minutes;
+search is complete from then on. It is the model the index never goes without.
 
-Code search never depends on EmbeddingGemma 2, and never waits for it: the code is embedded
-and searchable while the media model is still downloading, and images and audio get their
-content vectors afterwards (`index_status` → `media.state`: `loading`, `embedding`, `ready`).
-If the model cannot be downloaded or loaded — or the build cannot run it at all — the server
-logs why, and images and audio are matched by file name instead of by content (`name-only`);
-nothing else changes.
+**EmbeddingGemma 2 in the background.** It ranks somewhat better and embeds some thirty times
+slower, so it is given all the time it needs instead of being put in the way. Once MiniLM is
+done the server downloads it, embeds every chunk a second time — into its own set of
+vectors, next to MiniLM's — and, when that set covers the workspace, moves search over to it.
+Nothing is asked of the agent or of you: `index_status` reports `upgrade.state` (`waiting`,
+`loading`, `embedding`, `ready`) and `upgrade.searching`, and `embeddingModel` names the
+model that ranked the last search.
 
-EmbeddingGemma 2 also embeds text (code and prose in 100+ languages, where MiniLM is
-English-only), and `CODE_INTEL_MODEL=embeddinggemma2` uses it for everything. It is not the
-default because of what indexing with it costs. Measured on the 15.7k chunks of
-[Claudinio Code](https://github.com/claudin-io/claudinio-code), on a GitHub-hosted Linux
-runner (CPU only):
+What that costs, measured on the 15.7k chunks of
+[Claudinio Code](https://github.com/claudin-io/claudinio-code):
 
 | | all-MiniLM-L6-v2 | EmbeddingGemma 2 |
 |---|---|---|
-| First index | 4 min (66 chunks/s) | 2 h 21 min (1.8 chunks/s) |
+| Embedding the repository, GitHub-hosted Linux runner, 2 threads | 4 min (66 chunks/s) | 2 h 21 min (1.8 chunks/s) |
+| The same, projected from 161 chunks of another repository on a laptop at 8 threads | — | about 40 min (6.6 chunks/s) |
 | Encoding a query | 14 ms | 49 ms |
-| Expected file ranked first / in the top 3 / in the top 15 (59 queries) | 62% / 84% / 100% | 69% / 86% / 98% |
+| Expected file ranked first / in the top 3 / in the top 15 (59 queries, in English) | 62% / 84% / 100% | 69% / 86% / 98% |
+| Vectors on disk | 24 MB | 48 MB more |
 
-Four more queries answered at rank one, for thirty-six times the indexing time. See
-[Evaluating a model](#evaluating-a-model) to measure both on your own code.
+The upgrade is built around that hour:
 
-An index records which model wrote its text vectors and which wrote its media vectors. When
-one of them changes, that kind of file is re-embedded in the background and the other kind is
-left alone; vectors of two models are never mixed. `index_status` shows both.
+- it uses half the machine's physical cores (`CODE_INTEL_THREADS`), in the background, and stands aside
+  whenever a first index or an edited file is waiting to be embedded with MiniLM; the model
+  itself stays in memory for as long as the server runs;
+- it records its progress file by file, so closing the editor halfway costs nothing — the
+  next session carries on where this one stopped; and with two agents open on one repository,
+  only one of the two servers does the work;
+- once search has moved over, an edited file is re-embedded by both models: by MiniLM at
+  once, by EmbeddingGemma 2 a moment later, and is found by its text in between;
+- MiniLM's vectors are never dropped. If EmbeddingGemma 2 cannot be downloaded or loaded, or
+  the build cannot run it, or its set has fallen far behind (a change of branch that rewrote
+  half the repository), search uses MiniLM's and nothing else changes.
+
+`CODE_INTEL_UPGRADE=0` turns the upgrade off: no second download, no background hour, text
+search on MiniLM for good. `CODE_INTEL_MODEL=embeddinggemma2` is the opposite extreme —
+EmbeddingGemma 2 for everything from the start, with search by meaning arriving only as fast
+as that model embeds.
+
+**Images and audio.** What to fetch for them is decided per workspace from the files it
+actually contains (`.gitignore` respected): one with screenshots but no sounds never fetches
+the audio encoder. Images are `png jpg jpeg webp gif bmp`; audio is `wav mp3 flac ogg` (first
+30 s of a clip). SVG is indexed as code; video and AAC/M4A audio are not indexed. Up to 200
+media files per workspace get a content vector — encoding one image is seconds of CPU — and
+the rest stay findable by name. Media gets its vectors after the code has its own
+(`index_status` → `media.state`: `loading`, `embedding`, `ready`); without the model, images
+and audio are matched by file name instead of by content (`name-only`).
+
+An index records which model wrote each kind of vector — the first text set, the upgrade set,
+media. When one of them changes, that set is re-embedded in the background and the others are
+left alone; vectors of two models are never compared.
 
 > **How this is tested.** The loading, batching, media decoding and indexing paths are covered
 > by tests that run through ONNX Runtime against stand-in models with the same contracts, and
@@ -148,8 +169,9 @@ left alone; vectors of two models are never mixed. `index_status` shows both.
 > code, images and audio sensibly at all) and the eval below. The two search thresholds
 > specific to EmbeddingGemma 2 (`GEMMA2_MIN_COSINE_CANDIDATE`, `MEDIA_MIN_COSINE` in `db.rs`)
 > are set from that eval's score distributions on one repository. The media threshold rests on
-> 18 images, two descriptive queries and no real audio; the text one, which only applies under
-> `CODE_INTEL_MODEL=embeddinggemma2`, has not had its effect on ranking swept yet.
+> 18 images, two descriptive queries and no real audio. The text one — which every search uses
+> once the upgrade has taken over — has not had its effect on ranking swept yet: the eval that
+> does it takes hours, and is run on request.
 
 ### Evaluating a model
 
@@ -157,8 +179,9 @@ left alone; vectors of two models are never mixed. `index_status` shows both.
 cargo run --release --example semantic_eval -- /path/to/claudinio-code --sweep --report eval-report.txt
 ```
 
-indexes the workspace twice — as the server does by default, then with EmbeddingGemma 2 for
-text as well — and prints, for each: the rank of the expected file for 59 real queries (and
+indexes the workspace twice — with MiniLM, which is what search runs on until the upgrade has
+finished, then with EmbeddingGemma 2 for text, which is what it runs on afterwards — and
+prints, for each: the rank of the expected file for 59 real queries (and
 that 5 off-topic ones return nothing), the raw cosine distributions the vector gate is chosen
 from, a sweep over the fusion gates, how the workspace's images score against code queries and
 against queries that describe them, and indexing speed for text and for media separately. The query set
@@ -173,8 +196,9 @@ eval on a pinned commit of it for every pull request and puts the report in the 
 | `CODE_INTEL_WORKSPACE`, `--workspace <dir>` | directory to index (default: client roots, then cwd) |
 | `CODE_INTEL_CACHE_DIR`, `--cache-dir <dir>` | where indexes, the models and the binary live |
 | `CODE_INTEL_EMBEDDINGS=0`, `--no-embeddings` | lexical only, no model download |
-| `CODE_INTEL_MODEL` | `auto` (default: MiniLM for text, EmbeddingGemma 2 beside it for images and audio), `minilm` (MiniLM only; media by file name), or `embeddinggemma2` (EmbeddingGemma 2 for text too; no fallback) |
-| `CODE_INTEL_THREADS` | threads one model run may use (default 2: indexing is a background job) |
+| `CODE_INTEL_MODEL` | `auto` (default: MiniLM first, EmbeddingGemma 2 taking over in the background, and for images and audio), `minilm` (MiniLM only; media by file name), or `embeddinggemma2` (EmbeddingGemma 2 for everything from the start; no fallback) |
+| `CODE_INTEL_UPGRADE=0` | under `auto`, keep text search on MiniLM: no background upgrade |
+| `CODE_INTEL_THREADS` | threads one model run may use (default: half the physical cores, at least 2, at most 8) |
 | `CODE_INTEL_MEDIA=0` | do not index images and audio at all |
 | `CODE_INTEL_MEDIA_MAX` | media files per workspace that get a content vector (default 200) |
 | `CODE_INTEL_IMAGE_TOKENS` | detail per image: `70`, `140`, `280` (default), `560`, `1120` — fewer is faster |
@@ -182,7 +206,8 @@ eval on a pinned commit of it for every pull request and puts the report in the 
 | `CODE_INTEL_BIN` | run this binary instead of the downloaded one |
 
 `claudinio-code-intel index --workspace <dir>` builds the index and exits —
-useful to warm a cache before an agent session.
+useful to warm a cache before an agent session. With `--upgrade` it also runs
+the background upgrade to the end before exiting.
 
 ## Build from source
 

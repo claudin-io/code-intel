@@ -17,10 +17,11 @@
 //! load time, where the caller carries on without it, rather than at search
 //! time.
 //!
-//! By default this model is loaded for media only, beside MiniLM
-//! (`embeddings::CodeEmbedder`): the text half below then embeds the soft
-//! tokens of a picture or a clip and the queries compared against them, and
-//! `encode_documents` goes unused.
+//! By default this model is loaded beside MiniLM (`embeddings::CodeEmbedder`),
+//! which writes the index first. The text half below then does two jobs: it
+//! embeds the soft tokens of a picture or a clip and the queries compared
+//! against them, and it embeds the workspace's text a second time, in the
+//! background, into the index's upgrade set (`db::VectorSet`).
 
 use crate::media::{MediaKind, MediaNeeds};
 use crate::media_prep::{self, AudioFeatures, ImagePatches};
@@ -197,9 +198,9 @@ fn build_session(path: &Path) -> Result<Session, String> {
     Session::builder()
         .map_err(|e| format!("ort builder: {e}"))?
         // Same settings and reasons as the MiniLM session: no retained
-        // buffers between runs, and a thread cap (two unless
-        // `CODE_INTEL_THREADS` says otherwise) so indexing stays a background
-        // job instead of taking the whole machine.
+        // buffers between runs, and a thread cap (`embeddings::intra_threads`)
+        // so indexing stays a background job instead of taking the whole
+        // machine.
         .with_memory_pattern(false)
         .map_err(|e| format!("ort memory pattern: {e}"))?
         .with_intra_threads(crate::embeddings::intra_threads())
@@ -287,7 +288,7 @@ fn finalize(row: &[f32]) -> Result<Vec<f32>, String> {
 
 /// The vision and audio encoders, behind their own lock: encoding an image
 /// takes seconds, and a search must not wait for it. The text model — the
-/// only thing a query needs — lives under the embedder's lock instead.
+/// only thing a query needs — has a lock of its own (`Gemma2Embedder`).
 #[derive(Default)]
 pub struct MediaEncoders {
     vision: Option<Session>,
@@ -453,8 +454,12 @@ pub fn encode_media_file(
 
 // ── the embedder ────────────────────────────────────────────────────────
 
+/// The text model, shareable: a run locks its session and nothing else, so
+/// one thread can be embedding a workspace in the background, a batch at a
+/// time, while another embeds a query in between two batches — and neither
+/// holds whatever lock the caller keeps its embedders under.
 pub struct Gemma2Embedder {
-    session: Session,
+    session: Mutex<Session>,
     tokenizer: Tokenizer,
     /// Width of one soft token (the text model's hidden size).
     hidden: usize,
@@ -514,8 +519,8 @@ impl Gemma2Embedder {
 
         let encoders = MediaEncoders::default();
         let loaded = encoders.loaded.clone();
-        let mut embedder = Gemma2Embedder {
-            session,
+        let embedder = Gemma2Embedder {
+            session: Mutex::new(session),
             tokenizer,
             hidden,
             feature_inputs,
@@ -569,7 +574,7 @@ impl Gemma2Embedder {
     }
 
     fn run_text(
-        &mut self,
+        &self,
         ids: Vec<i64>,
         mask: Vec<i64>,
         batch: usize,
@@ -598,10 +603,11 @@ impl Gemma2Embedder {
                 f32_tensor(vec![rows, self.hidden as i64], data)?,
             );
         }
-        let outs = self
+        let mut session = self
             .session
-            .run(inputs)
-            .map_err(|e| format!("ort run: {e}"))?;
+            .lock()
+            .map_err(|e| format!("text model lock poisoned: {e}"))?;
+        let outs = session.run(inputs).map_err(|e| format!("ort run: {e}"))?;
         let (shape, flat) = outs[OUTPUT]
             .try_extract_tensor::<f32>()
             .map_err(|e| format!("extract {OUTPUT}: {e}"))?;
@@ -614,7 +620,7 @@ impl Gemma2Embedder {
         flat.chunks_exact(dim).map(finalize).collect()
     }
 
-    fn encode_prefixed(&mut self, prefix: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+    fn encode_prefixed(&self, prefix: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -646,11 +652,11 @@ impl Gemma2Embedder {
     }
 
     /// Embed index texts (code chunks, doc sections).
-    pub fn encode_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+    pub fn encode_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
         self.encode_prefixed(DOC_PREFIX, texts)
     }
 
-    pub fn encode_query(&mut self, text: &str, task: QueryTask) -> Result<Vec<f32>, String> {
+    pub fn encode_query(&self, text: &str, task: QueryTask) -> Result<Vec<f32>, String> {
         let prefix = match task {
             QueryTask::Code => CODE_QUERY_PREFIX,
             QueryTask::Media => MEDIA_QUERY_PREFIX,
@@ -686,7 +692,7 @@ impl Gemma2Embedder {
     }
 
     /// Embed one media item from the soft tokens its encoder produced.
-    pub fn embed_soft_tokens(&mut self, kind: MediaKind, soft: &[f32]) -> Result<Vec<f32>, String> {
+    pub fn embed_soft_tokens(&self, kind: MediaKind, soft: &[f32]) -> Result<Vec<f32>, String> {
         if soft.is_empty() || !soft.len().is_multiple_of(self.hidden) {
             return Err(format!(
                 "{} encoder returned {} values, not a multiple of the soft-token width {}",

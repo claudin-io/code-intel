@@ -11,7 +11,7 @@
 //! well; `gemma2_e2e.rs` is for that.
 #![cfg(feature = "embeddings")]
 
-use claudinio_code_intel::db::IndexDb;
+use claudinio_code_intel::db::{IndexDb, VectorSet};
 use claudinio_code_intel::embeddings::{
     self, CodeEmbedder, MINILM_MODEL_ID, ModelChoice, ModelProfile, SharedEmbedder,
 };
@@ -103,7 +103,7 @@ fn write_wav(path: &Path, hz: f64, seconds: f64) {
 #[test]
 fn text_model_alone_loads_and_embeds() {
     let dir = model_dir(&TEXT);
-    let mut e = Gemma2Embedder::load(dir.path()).expect("text model loads without any encoder");
+    let e = Gemma2Embedder::load(dir.path()).expect("text model loads without any encoder");
     assert_eq!(e.media_support(), MediaNeeds::NONE);
 
     let docs = [
@@ -268,7 +268,6 @@ fn audio_encoder_embeds_clips() {
             audio: true
         }
     );
-    let mut e = e;
     let soft_low = gemma2::encode_media_file(&e.encoders(), &low, MediaKind::Audio).unwrap();
     let soft_high = gemma2::encode_media_file(&e.encoders(), &high, MediaKind::Audio).unwrap();
     // 25 soft tokens per second of audio, 8 values each in the stand-in.
@@ -868,4 +867,378 @@ fn media_is_embedded_by_a_later_pass_once_its_model_arrives() {
     assert_eq!(db.media_embedding_count().unwrap(), 2);
     assert_eq!(db.index_stats().unwrap().2, text + 2);
     assert_eq!(db.embedding_pending_files().unwrap(), 0);
+}
+
+/// The text upgrade: MiniLM has written the index; EmbeddingGemma 2, once it
+/// is there, embeds the same chunks again beside MiniLM's without touching
+/// them — a file at a time, so that a pass which never finished is resumed
+/// rather than started over, and a file edited since is redone alone.
+#[test]
+fn the_upgrade_set_is_filled_beside_the_primary_one_and_kept_current() {
+    let models = models_root(&TEXT);
+    let rt = runtime();
+    let ws = workspace();
+    std::fs::write(
+        ws.path().join("src").join("session.rs"),
+        "/// Signs the user out when the stored session has expired.\n\
+         pub fn expire_stale_session(age_minutes: u32) -> bool {\n    age_minutes > 30\n}\n",
+    )
+    .unwrap();
+    let root = ws.path().to_string_lossy().to_string();
+    let db = IndexDb::open(&ws.path().join("index.db")).unwrap();
+    indexer::scan_workspace(&db, &root, None, None, None).unwrap();
+
+    let shared = rt
+        .block_on(embeddings::ensure_and_load(
+            models.path(),
+            ModelChoice::Auto,
+            MediaNeeds::NONE,
+        ))
+        .unwrap();
+    let (_, text) = indexer::generate_all_embeddings(&db, &shared, None, &root).unwrap();
+    assert!(text >= 2, "both source files");
+
+    // Before EmbeddingGemma 2 is in the process there is nothing to upgrade
+    // with, and saying so is all that happens.
+    assert_eq!(shared.lock().unwrap().upgrade_model(), None);
+    assert!(indexer::generate_upgrade_embeddings(&db, &shared, None, &root, indexer::UpgradeTurn::default()).is_err());
+    assert!(embeddings::encode_upgrade_query(&shared, "expired session").is_err());
+    assert_eq!(db.upgrade_state().unwrap().vectors, 0);
+
+    assert!(rt.block_on(embeddings::ensure_text_upgrade(&shared)));
+    assert_eq!(
+        shared.lock().unwrap().upgrade_model(),
+        Some((gemma2::MODEL_ID, gemma2::EMBED_DIM))
+    );
+    assert_eq!(
+        shared.lock().unwrap().model_id(),
+        MINILM_MODEL_ID,
+        "the text model itself is still MiniLM"
+    );
+
+    // A turn that is over before it starts does nothing, and says how much
+    // there is still to do.
+    let out_of_time = indexer::generate_upgrade_embeddings(
+        &db,
+        &shared,
+        None,
+        &root,
+        indexer::UpgradeTurn {
+            budget: Some(std::time::Duration::ZERO),
+            after: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        (out_of_time.files, out_of_time.remaining, out_of_time.complete),
+        (0, 2, false)
+    );
+    assert!(!db.upgrade_state().unwrap().usable(gemma2::MODEL_ID));
+
+    let seen: Mutex<Vec<(i64, i64)>> = Mutex::new(Vec::new());
+    let sink = |p: indexer::IndexProgress| seen.lock().unwrap().push((p.files_indexed, p.total_files));
+    let pass =
+        indexer::generate_upgrade_embeddings(&db, &shared, Some(&sink), &root, indexer::UpgradeTurn::default())
+            .unwrap();
+    assert_eq!(*seen.lock().unwrap(), [(1, 2), (2, 2)], "progress counts the workspace's text files");
+    assert!(pass.complete);
+    assert_eq!((pass.left, pass.remaining), (0, 0));
+    assert_eq!(pass.vectors, text, "every chunk MiniLM embedded, and no media");
+    let state = db.upgrade_state().unwrap();
+    assert_eq!(state.vectors, text);
+    assert_eq!(state.pending_files, 0);
+    assert!(state.usable(gemma2::MODEL_ID));
+    assert_eq!(db.index_stats().unwrap().2, text, "MiniLM's vectors are all still there");
+    assert_eq!(db.embedding_model().as_deref(), Some(MINILM_MODEL_ID));
+
+    // A query for each set comes from that set's model.
+    let query = embeddings::encode_upgrade_query(&shared, "expired session").unwrap();
+    assert_unit(&query);
+    assert_eq!(
+        embeddings::encode_query(&shared, "expired session").unwrap().len(),
+        embeddings::MINILM_DIM
+    );
+    let hits = db
+        .search_hybrid_in(VectorSet::Upgrade, "expire stale session", Some(&query), 5)
+        .unwrap();
+    assert!(hits.iter().any(|h| h.file_path.ends_with("session.rs")));
+
+    // Nothing changed: a second pass has nothing to do.
+    let again = indexer::generate_upgrade_embeddings(&db, &shared, None, &root, indexer::UpgradeTurn::default()).unwrap();
+    assert_eq!((again.files, again.vectors, again.complete), (0, 0, true));
+
+    // One file is edited. The watcher re-embeds it with MiniLM at once; the
+    // upgrade set is one file behind — still the one searched — and the next
+    // pass embeds that file and no other.
+    let session = ws.path().join("src").join("session.rs");
+    std::fs::write(
+        &session,
+        "/// Signs the user out when the stored session has expired.\n\
+         pub fn expire_stale_session(age_minutes: u32) -> bool {\n    age_minutes > 45\n}\n\n\
+         /// Extends a session that is about to expire.\n\
+         pub fn renew_session(age_minutes: u32) -> u32 {\n    age_minutes / 2\n}\n",
+    )
+    .unwrap();
+    indexer::reindex_file(
+        &db,
+        &session.to_string_lossy(),
+        Some(&mut *shared.lock().unwrap()),
+        Some(&root),
+    )
+    .unwrap();
+    let state = db.upgrade_state().unwrap();
+    assert_eq!(state.pending_files, 1);
+    assert!(state.usable(gemma2::MODEL_ID));
+    let behind = state.vectors;
+    assert!(behind < text, "the edited file's old vectors are gone");
+
+    let pass = indexer::generate_upgrade_embeddings(&db, &shared, None, &root, indexer::UpgradeTurn::default()).unwrap();
+    assert_eq!(pass.files, 1);
+    assert!(pass.complete);
+    let state = db.upgrade_state().unwrap();
+    assert_eq!(state.pending_files, 0);
+    assert_eq!(state.vectors, behind + pass.vectors);
+    assert_eq!(
+        state.vectors,
+        db.index_stats().unwrap().2,
+        "both sets hold the same chunks again"
+    );
+}
+
+/// Only the default choice has an upgrade: MiniLM asked for by name stays
+/// MiniLM, and EmbeddingGemma 2 as the text model has nothing to upgrade to.
+#[test]
+fn an_explicit_model_choice_has_no_upgrade() {
+    let models = models_root(&TEXT);
+    let rt = runtime();
+    for choice in [ModelChoice::MiniLm, ModelChoice::Gemma2] {
+        let shared = rt
+            .block_on(embeddings::ensure_and_load(
+                models.path(),
+                choice,
+                MediaNeeds::NONE,
+            ))
+            .unwrap();
+        assert!(!rt.block_on(embeddings::ensure_text_upgrade(&shared)), "{choice:?}");
+        assert_eq!(shared.lock().unwrap().upgrade_model(), None, "{choice:?}");
+        assert!(embeddings::encode_upgrade_documents(&shared, &["fn main() {}"]).is_err());
+    }
+}
+
+/// An EmbeddingGemma 2 that cannot be loaded costs the upgrade and nothing
+/// else — and is not tried again for every workspace.
+#[test]
+fn an_unloadable_gemma2_leaves_text_on_minilm_without_an_upgrade() {
+    let models = models_root(&[]);
+    let dir = models.path().join(gemma2::CACHE_DIRNAME);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (_, local, _, _) in gemma2::component_files(None) {
+        std::fs::write(dir.join(local), b"not a model").unwrap();
+    }
+    let rt = runtime();
+    let shared = rt
+        .block_on(embeddings::ensure_and_load(
+            models.path(),
+            ModelChoice::Auto,
+            MediaNeeds::NONE,
+        ))
+        .unwrap();
+    assert!(!rt.block_on(embeddings::ensure_text_upgrade(&shared)));
+    assert!(!rt.block_on(embeddings::ensure_text_upgrade(&shared)));
+    assert_eq!(shared.lock().unwrap().upgrade_model(), None);
+    assert_eq!(
+        embeddings::encode_query(&shared, "expired session").unwrap().len(),
+        embeddings::MINILM_DIM
+    );
+}
+
+/// One turn takes up where the last one stopped, so a file that cannot be
+/// finished is not where every turn begins.
+#[test]
+fn an_upgrade_turn_starts_after_the_file_the_last_one_ended_on() {
+    let (db, shared, ws, root) = upgrade_ready_index(&[
+        ("a.rs", "/// First.\npub fn first_thing() -> u32 { 1 }\n"),
+        ("b.rs", "/// Second.\npub fn second_thing() -> u32 { 2 }\n"),
+        ("c.rs", "/// Third.\npub fn third_thing() -> u32 { 3 }\n"),
+    ]);
+    let ids: Vec<i64> = ["a.rs", "b.rs", "c.rs"]
+        .iter()
+        .map(|name| {
+            let path = ws.path().join("src").join(name);
+            db.file_by_path(&path.to_string_lossy()).unwrap().unwrap().id
+        })
+        .collect();
+    let mut ordered = ids.clone();
+    ordered.sort_unstable();
+
+    let turn = indexer::UpgradeTurn {
+        budget: None,
+        after: Some(ordered[0]),
+    };
+    let pass = indexer::generate_upgrade_embeddings(&db, &shared, None, &root, turn).unwrap();
+    assert_eq!((pass.files, pass.remaining), (2, 0));
+    assert_eq!(pass.last_file, Some(ordered[2]));
+    assert!(!pass.complete, "the first file is still to do");
+    assert_eq!(db.upgrade_state().unwrap().pending_files, 1);
+
+    // The round after it starts from the top and finds only that one.
+    let pass =
+        indexer::generate_upgrade_embeddings(&db, &shared, None, &root, indexer::UpgradeTurn::default()).unwrap();
+    assert_eq!((pass.files, pass.last_file, pass.complete), (1, Some(ordered[0]), true));
+}
+
+/// A file edited and then put back as it was has its old hash and none of
+/// its old vectors: the upgrade set must see it as a file to embed.
+#[test]
+fn a_file_edited_and_put_back_is_embedded_again() {
+    let original = "/// Signs the user out when the stored session has expired.\n\
+                    pub fn expire_stale_session(age_minutes: u32) -> bool {\n    age_minutes > 30\n}\n";
+    let (db, shared, ws, root) = upgrade_ready_index(&[("session.rs", original)]);
+    let pass =
+        indexer::generate_upgrade_embeddings(&db, &shared, None, &root, indexer::UpgradeTurn::default()).unwrap();
+    assert!(pass.complete);
+    let vectors = db.upgrade_state().unwrap().vectors;
+    assert!(vectors >= 1);
+
+    let path = ws.path().join("src").join("session.rs");
+    let reindex = |content: &str| {
+        std::fs::write(&path, content).unwrap();
+        indexer::reindex_file(
+            &db,
+            &path.to_string_lossy(),
+            Some(&mut *shared.lock().unwrap()),
+            Some(&root),
+        )
+        .unwrap();
+    };
+    reindex("/// Something else entirely.\npub fn unrelated() -> u32 { 7 }\n");
+    reindex(original);
+
+    let state = db.upgrade_state().unwrap();
+    assert_eq!(state.vectors, 0, "the old symbols took their vectors with them");
+    assert_eq!(state.pending_files, 1, "the same hash as before is not the same as done");
+    let pass =
+        indexer::generate_upgrade_embeddings(&db, &shared, None, &root, indexer::UpgradeTurn::default()).unwrap();
+    assert_eq!((pass.files, pass.complete), (1, true));
+    assert_eq!(db.upgrade_state().unwrap().vectors, vectors);
+}
+
+/// The upgrade runs with the watcher free to take edits in — here, the same
+/// file over and over, in both directions, while its chunks are at the
+/// model. Whatever the interleaving, what is left once the dust has settled
+/// is exactly what a fresh index of the final content holds: no file marked
+/// done that is not, and no vector of an older text.
+#[test]
+fn a_file_that_keeps_changing_under_the_upgrade_ends_up_right() {
+    let body = |tag: &str| -> String {
+        (0..40)
+            .map(|i| {
+                format!(
+                    "/// Handles step {i} of the {tag} pipeline.\npub fn {tag}_step_{i}(input: u32) -> u32 {{\n    input + {i}\n}}\n\n"
+                )
+            })
+            .collect()
+    };
+    let (first, second) = (body("ingest"), body("export"));
+    let (db, shared, ws, root) = upgrade_ready_index(&[
+        ("pipeline.rs", first.as_str()),
+        ("steady.rs", "/// Never edited.\npub fn steady_state() -> u32 { 4 }\n"),
+    ]);
+    let path = ws.path().join("src").join("pipeline.rs");
+
+    std::thread::scope(|scope| {
+        let upgrade = scope.spawn(|| {
+            // Rounds, as the worker runs them, for as long as edits come in.
+            let mut rounds = 0;
+            loop {
+                let pass =
+                    indexer::generate_upgrade_embeddings(&db, &shared, None, &root, indexer::UpgradeTurn::default())
+                        .unwrap();
+                rounds += 1;
+                if (pass.left == 0 && rounds >= 4) || rounds >= 40 {
+                    return;
+                }
+            }
+        });
+        for round in 0..6 {
+            std::thread::sleep(std::time::Duration::from_millis(40 + 25 * round));
+            let content = if round % 2 == 0 { &second } else { &first };
+            // What the watcher does: under the indexing semaphore.
+            let editing = loop {
+                match claudinio_code_intel::INDEX_SEMAPHORE.try_acquire() {
+                    Ok(permit) => break permit,
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            };
+            std::fs::write(&path, content).unwrap();
+            indexer::reindex_file(
+                &db,
+                &path.to_string_lossy(),
+                Some(&mut *shared.lock().unwrap()),
+                Some(&root),
+            )
+            .unwrap();
+            drop(editing);
+        }
+        upgrade.join().unwrap();
+    });
+    // The last edit put the first content back.
+    let last =
+        indexer::generate_upgrade_embeddings(&db, &shared, None, &root, indexer::UpgradeTurn::default()).unwrap();
+    assert!(last.complete);
+    let state = db.upgrade_state().unwrap();
+    assert_eq!(state.pending_files, 0);
+    assert_eq!(state.vectors, db.index_stats().unwrap().2, "one upgrade vector per chunk, no more");
+
+    let (fresh_db, _, _fresh_ws, fresh_root) = upgrade_ready_index(&[
+        ("pipeline.rs", first.as_str()),
+        ("steady.rs", "/// Never edited.\npub fn steady_state() -> u32 { 4 }\n"),
+    ]);
+    indexer::generate_upgrade_embeddings(&fresh_db, &shared, None, &fresh_root, indexer::UpgradeTurn::default())
+        .unwrap();
+    assert_eq!(fresh_db.upgrade_state().unwrap().vectors, state.vectors);
+    // Vector for vector: every chunk of the final content has, in the index
+    // that was edited under the upgrade, the vector a fresh index gives it.
+    let vectors = |db: &IndexDb| -> Vec<(String, i64, Vec<f32>)> {
+        let mut rows: Vec<(String, i64, Vec<f32>)> = db
+            .load_all_embeddings_in(VectorSet::Upgrade)
+            .unwrap()
+            .into_iter()
+            .map(|(symbol, start, _, vector)| (symbol.name, start, vector))
+            .collect();
+        rows.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        rows
+    };
+    let (stressed, fresh) = (vectors(&db), vectors(&fresh_db));
+    assert!(fresh.len() >= 41, "forty steps and the steady file");
+    assert_eq!(stressed.len(), fresh.len());
+    for (s, f) in stressed.iter().zip(&fresh) {
+        assert_eq!((&s.0, s.1), (&f.0, f.1));
+        assert!(dot(&s.2, &f.2) > 0.9999, "{} holds a vector of another text", s.0);
+    }
+}
+
+/// An index of the given `src/` files, embedded by MiniLM, with the upgrade
+/// model loaded and the upgrade set still empty.
+fn upgrade_ready_index(files: &[(&str, &str)]) -> (IndexDb, SharedEmbedder, tempfile::TempDir, String) {
+    let models = models_root(&TEXT);
+    let rt = runtime();
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(ws.path().join("src")).unwrap();
+    for (name, content) in files {
+        std::fs::write(ws.path().join("src").join(name), content).unwrap();
+    }
+    let root = ws.path().to_string_lossy().to_string();
+    let db = IndexDb::open(&ws.path().join("index.db")).unwrap();
+    indexer::scan_workspace(&db, &root, None, None, None).unwrap();
+    let shared = rt
+        .block_on(embeddings::ensure_and_load(
+            models.path(),
+            ModelChoice::Auto,
+            MediaNeeds::NONE,
+        ))
+        .unwrap();
+    indexer::generate_all_embeddings(&db, &shared, None, &root).unwrap();
+    assert!(rt.block_on(embeddings::ensure_text_upgrade(&shared)));
+    (db, shared, ws, root)
 }

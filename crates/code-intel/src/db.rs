@@ -99,7 +99,7 @@ pub struct EmbeddingReset {
 }
 
 /// One persisted retrieval chunk, as fed to the embedding pass.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredChunk {
     pub symbol_id: i64,
     pub chunk_index: i64,
@@ -111,14 +111,78 @@ pub struct StoredChunk {
 /// Bump when the index format changes (schema, embedding layout, ignore
 /// rules). A mismatched on-disk index is deleted and rebuilt from scratch.
 ///
-/// Not bumped for `index_meta` and media rows: both are additive, and a model
-/// change is handled by `reconcile_embedding_model`, which drops vectors only
-/// — a v7 index that stays on MiniLM keeps every one of its embeddings.
+/// Not bumped for `index_meta`, media rows and the upgrade set: all are
+/// additive, and a model change is handled by `reconcile_embedding_model`,
+/// which drops vectors only — a v7 index that stays on MiniLM keeps every one
+/// of its embeddings.
 const SCHEMA_VERSION: i64 = 7;
 
 const META_EMBED_MODEL: &str = "embed_model";
 const META_MEDIA_MODEL: &str = "media_model";
 const META_MEDIA_STATE: &str = "media_state";
+const META_UPGRADE_MODEL: &str = "upgrade_model";
+const META_UPGRADE_COMPLETE: &str = "upgrade_complete";
+
+/// An index can hold the text of a workspace embedded twice.
+///
+/// The primary set is written first, by a model fast enough that search is
+/// useful minutes after a workspace is opened. The upgrade set holds the same
+/// chunks embedded by a slower model that ranks better, filled in the
+/// background over the following minutes or hours; search moves to it once it
+/// covers the workspace (`UpgradeState::usable`) and back whenever the model
+/// that wrote it is not there to embed the query. Vectors of the two are
+/// never compared with each other, which is why they do not share a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorSet {
+    /// `symbol_embeddings`: every index has it. Media vectors live here too.
+    Primary,
+    /// `symbol_embeddings_upgrade`: text only.
+    Upgrade,
+}
+
+impl VectorSet {
+    fn table(self) -> &'static str {
+        match self {
+            VectorSet::Primary => "symbol_embeddings",
+            VectorSet::Upgrade => "symbol_embeddings_upgrade",
+        }
+    }
+}
+
+/// How far behind the upgrade set may be and still be the one searched: this
+/// many files, or one file in twenty, whichever is more.
+///
+/// Zero would hand search back to the primary set on every save, and to a
+/// different ranking with it, for the seconds the slow model needs to catch
+/// up; a file it has not reached yet is still found by its text meanwhile.
+/// What this allowance does not cover is a change of branch that rewrites
+/// half the workspace — there the primary set, current again within a
+/// minute, is the better one to search until the upgrade set has caught up.
+const UPGRADE_LAG_FILES: i64 = 3;
+const UPGRADE_LAG_DIVISOR: i64 = 20;
+
+/// Where an index's upgrade set stands.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpgradeState {
+    /// The model that wrote it, once anything has.
+    pub model: Option<String>,
+    /// A pass has covered every text file of the workspace at least once.
+    pub complete: bool,
+    /// Text files whose current content it does not hold.
+    pub pending_files: i64,
+    pub text_files: i64,
+    pub vectors: i64,
+}
+
+impl UpgradeState {
+    /// Whether search should use this set, given that `model` is the one
+    /// loaded to embed queries with.
+    pub fn usable(&self, model: &str) -> bool {
+        self.complete
+            && self.model.as_deref() == Some(model)
+            && self.pending_files <= UPGRADE_LAG_FILES.max(self.text_files / UPGRADE_LAG_DIVISOR)
+    }
+}
 
 /// Tuning knobs for `search_hybrid_with`. `Default` holds the production
 /// values, calibrated with `examples/semantic_eval.rs --sweep` — re-run the
@@ -522,6 +586,22 @@ impl IndexDb {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS symbol_embeddings_upgrade (
+                symbol_id INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                start_line INTEGER NOT NULL DEFAULT 0,
+                end_line INTEGER NOT NULL DEFAULT 0,
+                embedding BLOB NOT NULL,
+                PRIMARY KEY(symbol_id, chunk_index),
+                FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS file_upgrade (
+                file_id INTEGER PRIMARY KEY,
+                hash TEXT NOT NULL,
+                FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+            );
             ",
         )
         .map_err(|e| format!("schema: {e}"))?;
@@ -708,11 +788,14 @@ impl IndexDb {
     /// retry.)
     ///
     /// One transaction: a process killed halfway must not leave an index
-    /// whose vectors are gone but whose files still say "embedded".
+    /// whose vectors are gone but whose files still say "embedded". And one
+    /// that takes the write lock before it reads (`BEGIN IMMEDIATE`): it
+    /// reads, then writes, and begun the default way it fails outright if
+    /// another connection — a second server on the same repository, an hour
+    /// into its upgrade — commits in between.
     pub fn reconcile_embedding_model(&self, profile: &ModelProfile) -> Result<EmbeddingReset, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let tx = conn
-            .unchecked_transaction()
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("begin reconcile: {e}"))?;
         let mut reset = EmbeddingReset::default();
 
@@ -932,6 +1015,13 @@ impl IndexDb {
             .map_err(|e| format!("delete relations: {e}"))?;
         conn.execute("DELETE FROM symbol_embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)", params![file_id])
             .map_err(|e| format!("delete embeddings: {e}"))?;
+        conn.execute("DELETE FROM symbol_embeddings_upgrade WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)", params![file_id])
+            .map_err(|e| format!("delete upgrade embeddings: {e}"))?;
+        // And the record that the upgrade set had this file. The hash alone
+        // cannot carry that: a file edited and then put back as it was has
+        // its old hash again and none of its old vectors.
+        conn.execute("DELETE FROM file_upgrade WHERE file_id = ?1", params![file_id])
+            .map_err(|e| format!("requeue upgrade file: {e}"))?;
         // Explicit deletes (not cascades) so the AFTER DELETE triggers fire
         // and purge the external-content FTS rows deterministically.
         conn.execute("DELETE FROM symbol_chunks WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)", params![file_id])
@@ -1197,11 +1287,26 @@ impl IndexDb {
         end_line: i64,
         embedding: &[f32],
     ) -> Result<(), String> {
+        self.upsert_embedding_in(VectorSet::Primary, symbol_id, chunk_index, start_line, end_line, embedding)
+    }
+
+    pub fn upsert_embedding_in(
+        &self,
+        set: VectorSet,
+        symbol_id: i64,
+        chunk_index: i64,
+        start_line: i64,
+        end_line: i64,
+        embedding: &[f32],
+    ) -> Result<(), String> {
         let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
-            "INSERT OR REPLACE INTO symbol_embeddings (symbol_id, chunk_index, start_line, end_line, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &format!(
+                "INSERT OR REPLACE INTO {} (symbol_id, chunk_index, start_line, end_line, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                set.table()
+            ),
             params![symbol_id, chunk_index, start_line, end_line, bytes],
         )
         .map_err(|e| format!("upsert embedding: {e}"))?;
@@ -1209,27 +1314,200 @@ impl IndexDb {
     }
 
     pub fn delete_embeddings_for_file(&self, file_id: i64) -> Result<(), String> {
+        self.delete_embeddings_for_file_in(VectorSet::Primary, file_id)
+    }
+
+    pub fn delete_embeddings_for_file_in(&self, set: VectorSet, file_id: i64) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
-            "DELETE FROM symbol_embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+            &format!(
+                "DELETE FROM {} WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+                set.table()
+            ),
             params![file_id],
         )
         .map_err(|e| format!("delete embeddings: {e}"))?;
         Ok(())
     }
 
-    /// Every embedded chunk, as stored.
-    pub fn load_all_embeddings(&self) -> Result<Vec<EmbeddingRow>, String> {
+    // ── the upgrade set ─────────────────────────────────────────────────
+
+    /// The model the upgrade set was written by, if it holds anything.
+    pub fn upgrade_model(&self) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+        Self::meta_get(&conn, META_UPGRADE_MODEL)
+    }
+
+    /// Make the upgrade set consistent with the model about to write to it:
+    /// vectors of another model (by recorded id, or by length — the id of a
+    /// set an interrupted process left behind may never have been written)
+    /// are dropped, and with them the record of which files were done.
+    /// Returns whether anything was dropped.
+    ///
+    /// Called at the start of every turn of the upgrade, with the watcher
+    /// free to write through its own connection meanwhile. So the usual case
+    /// — nothing to change — writes nothing, and the rare one takes the
+    /// write lock before it reads: a transaction that read first and wrote
+    /// afterwards would fail outright whenever the other connection had
+    /// committed in between.
+    pub fn reconcile_upgrade_model(&self, model: &str, dim: usize) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mismatch = |conn: &Connection| -> Result<(Option<String>, bool), String> {
+            let stored = Self::meta_get(conn, META_UPGRADE_MODEL);
+            let foreign: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM symbol_embeddings_upgrade WHERE length(embedding) != ?1)",
+                    params![(dim * 4) as i64],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("upgrade reconcile: {e}"))?;
+            let wrong = stored.as_deref().is_some_and(|s| s != model) || foreign != 0;
+            Ok((stored, wrong))
+        };
+        let (stored, wrong) = mismatch(&conn)?;
+        if !wrong && stored.as_deref() == Some(model) {
+            return Ok(false);
+        }
+
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("begin upgrade reconcile: {e}"))?;
+        // Again, now that nothing else can write.
+        let (stored, wrong) = mismatch(&tx)?;
+        if wrong {
+            let vectors = tx
+                .execute("DELETE FROM symbol_embeddings_upgrade", [])
+                .map_err(|e| format!("drop upgrade embeddings: {e}"))?;
+            tx.execute("DELETE FROM file_upgrade", [])
+                .map_err(|e| format!("requeue upgrade files: {e}"))?;
+            Self::meta_set(&tx, META_UPGRADE_COMPLETE, "0")?;
+            if vectors > 0 {
+                eprintln!(
+                    "[index] upgrade embedding model changed ({} -> {model}); re-embedding in the background",
+                    stored.as_deref().unwrap_or("unrecorded")
+                );
+            }
+        }
+        Self::meta_set(&tx, META_UPGRADE_MODEL, model)?;
+        tx.commit().map_err(|e| format!("commit upgrade reconcile: {e}"))?;
+        Ok(wrong)
+    }
+
+    /// For each file the upgrade set has embedded: the content hash it was
+    /// embedded from.
+    pub fn upgrade_hashes(&self) -> Result<std::collections::HashMap<i64, String>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
-            .prepare(
+            .prepare("SELECT file_id, hash FROM file_upgrade")
+            .map_err(|e| format!("prepare upgrade hashes: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| format!("query upgrade hashes: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Records that the upgrade set's vectors for this file reflect `hash`.
+    pub fn set_upgrade_hash(&self, file_id: i64, hash: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO file_upgrade (file_id, hash) VALUES (?1, ?2)
+             ON CONFLICT(file_id) DO UPDATE SET hash = excluded.hash",
+            params![file_id, hash],
+        )
+        .map_err(|e| format!("set upgrade hash: {e}"))?;
+        Ok(())
+    }
+
+    /// Give up on a file for the upgrade set: record it as done in its
+    /// current content, with whatever vectors it has. For a file the model
+    /// keeps failing on — it stays findable by its text, and one file must
+    /// not keep the whole set from ever being complete. It is tried again
+    /// when it changes.
+    pub fn skip_upgrade_file(&self, file_id: i64) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO file_upgrade (file_id, hash)
+             SELECT id, hash FROM files WHERE id = ?1 AND hash IS NOT NULL
+             ON CONFLICT(file_id) DO UPDATE SET hash = excluded.hash",
+            params![file_id],
+        )
+        .map_err(|e| format!("skip upgrade file: {e}"))?;
+        Ok(())
+    }
+
+    /// Text files whose current content the upgrade set does not hold. An
+    /// error is an error: read as zero it would say "nothing left to do".
+    fn upgrade_pending_locked(conn: &Connection) -> Result<i64, String> {
+        conn.query_row(
+            &format!(
+                "SELECT count(*) FROM files f
+                 LEFT JOIN file_upgrade u ON u.file_id = f.id
+                 WHERE (f.language IS NULL OR f.language NOT IN ({MEDIA_KINDS_SQL}))
+                   AND (u.hash IS NULL OR u.hash != f.hash)"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("upgrade pending: {e}"))
+    }
+
+    pub fn upgrade_state(&self) -> Result<UpgradeState, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let text_files: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM files
+                     WHERE language IS NULL OR language NOT IN ({MEDIA_KINDS_SQL})"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("upgrade state: {e}"))?;
+        let vectors: i64 = conn
+            .query_row("SELECT count(*) FROM symbol_embeddings_upgrade", [], |row| row.get(0))
+            .map_err(|e| format!("upgrade state: {e}"))?;
+        Ok(UpgradeState {
+            model: Self::meta_get(&conn, META_UPGRADE_MODEL),
+            complete: Self::meta_get(&conn, META_UPGRADE_COMPLETE).as_deref() == Some("1"),
+            pending_files: Self::upgrade_pending_locked(&conn)?,
+            text_files,
+            vectors,
+        })
+    }
+
+    /// Record that the upgrade set has covered the whole workspace — if it
+    /// has: a file edited while the pass ran leaves it one short, and the
+    /// next pass is the one that gets to say so. Returns whether it is
+    /// complete now.
+    pub fn mark_upgrade_complete(&self) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        if Self::upgrade_pending_locked(&conn)? != 0 {
+            return Ok(Self::meta_get(&conn, META_UPGRADE_COMPLETE).as_deref() == Some("1"));
+        }
+        Self::meta_set(&conn, META_UPGRADE_COMPLETE, "1")?;
+        Ok(true)
+    }
+
+    /// Every embedded chunk of the primary set, as stored.
+    pub fn load_all_embeddings(&self) -> Result<Vec<EmbeddingRow>, String> {
+        self.load_all_embeddings_in(VectorSet::Primary)
+    }
+
+    /// Every embedded chunk of one set, as stored. For analysis and tests:
+    /// search never loads a set whole (`vector_leg_candidates`).
+    pub fn load_all_embeddings_in(&self, set: VectorSet) -> Result<Vec<EmbeddingRow>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(&format!(
                 "SELECT s.id, s.file_id, s.name, s.kind, s.signature,
                         s.start_line, s.start_col, s.end_line, s.end_col, f.path,
                         e.start_line, e.end_line, e.embedding
                  FROM symbols s
                  JOIN files f ON f.id = s.file_id
-                 JOIN symbol_embeddings e ON e.symbol_id = s.id",
-            )
+                 JOIN {} e ON e.symbol_id = s.id",
+                set.table()
+            ))
             .map_err(|e| format!("prepare: {e}"))?;
         let results = stmt
             .query_map([], |row| {
@@ -1273,19 +1551,29 @@ impl IndexDb {
         page_size: i64,
         offset: i64,
     ) -> Result<Vec<EmbeddingRow>, String> {
+        self.load_embeddings_page_in(VectorSet::Primary, page_size, offset)
+    }
+
+    pub fn load_embeddings_page_in(
+        &self,
+        set: VectorSet,
+        page_size: i64,
+        offset: i64,
+    ) -> Result<Vec<EmbeddingRow>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT s.id, s.file_id, s.name, s.kind, s.signature,
                         s.start_line, s.start_col, s.end_line, s.end_col, f.path,
                         e.start_line, e.end_line, e.embedding
                  FROM symbols s
                  JOIN files f ON f.id = s.file_id
-                 JOIN symbol_embeddings e ON e.symbol_id = s.id
+                 JOIN {} e ON e.symbol_id = s.id
                  WHERE s.kind NOT IN ('image','audio')
                  ORDER BY s.id, e.start_line
                  LIMIT ? OFFSET ?",
-            )
+                set.table()
+            ))
             .map_err(|e| format!("prepare: {e}"))?;
         let results = stmt
             .query_map(params![page_size, offset], |row| {
@@ -1324,6 +1612,7 @@ impl IndexDb {
     /// `min_cosine`, reduced to the best chunk per symbol, ranked by cosine.
     fn vector_leg_candidates(
         &self,
+        set: VectorSet,
         query_vec: &[f32],
         min_cosine: f32,
         k: usize,
@@ -1332,7 +1621,7 @@ impl IndexDb {
             std::collections::HashMap::new();
         let mut offset: i64 = 0;
         loop {
-            let page = self.load_embeddings_page(EMBEDDING_PAGE_SIZE, offset)?;
+            let page = self.load_embeddings_page_in(set, EMBEDDING_PAGE_SIZE, offset)?;
             let page_len = page.len();
             if page.is_empty() {
                 break;
@@ -1447,8 +1736,25 @@ impl IndexDb {
         query_vec: Option<&[f32]>,
         limit: usize,
     ) -> Result<Vec<SemanticSearchResult>, String> {
-        let params = HybridParams::for_model(self.embedding_model().as_deref());
-        self.search_hybrid_with(query_text, query_vec, limit, &params)
+        self.search_hybrid_in(VectorSet::Primary, query_text, query_vec, limit)
+    }
+
+    /// `search_hybrid` over one of the index's sets of text vectors, with the
+    /// knobs of the model that wrote it. `query_vec` must come from that
+    /// model.
+    pub fn search_hybrid_in(
+        &self,
+        set: VectorSet,
+        query_text: &str,
+        query_vec: Option<&[f32]>,
+        limit: usize,
+    ) -> Result<Vec<SemanticSearchResult>, String> {
+        let model = match set {
+            VectorSet::Primary => self.embedding_model(),
+            VectorSet::Upgrade => self.upgrade_model(),
+        };
+        let params = HybridParams::for_model(model.as_deref());
+        self.search_hybrid_with_in(set, query_text, query_vec, limit, &params)
     }
 
     /// Images and audio matching a query: by content, when `query_vec` (from
@@ -1611,12 +1917,24 @@ impl IndexDb {
         limit: usize,
         params: &HybridParams,
     ) -> Result<Vec<SemanticSearchResult>, String> {
+        self.search_hybrid_with_in(VectorSet::Primary, query_text, query_vec, limit, params)
+    }
+
+    /// `search_hybrid_with` over one of the index's sets of text vectors.
+    pub fn search_hybrid_with_in(
+        &self,
+        set: VectorSet,
+        query_text: &str,
+        query_vec: Option<&[f32]>,
+        limit: usize,
+        params: &HybridParams,
+    ) -> Result<Vec<SemanticSearchResult>, String> {
         let tokens = tokenize_query(query_text);
         let match_query = build_fts_match_query(query_text);
 
         let vector_hits = match query_vec {
             Some(qv) => {
-                self.vector_leg_candidates(qv, params.min_cosine_candidate, params.k_candidates)?
+                self.vector_leg_candidates(set, qv, params.min_cosine_candidate, params.k_candidates)?
             }
             None => vec![],
         };
@@ -2243,6 +2561,238 @@ mod tests {
         .unwrap();
         db.set_embed_hash(file_id, "h1").unwrap();
         assert_eq!(db.embedding_pending_files().unwrap(), 0);
+    }
+
+    /// The two sets hold vectors of different models for the same chunks: a
+    /// search reads the one it is pointed at and never the other.
+    #[test]
+    fn the_upgrade_set_is_searched_apart_from_the_primary_one() {
+        let db = IndexDb::open(Path::new(":memory:")).expect("open in-memory db");
+        let fa = db.upsert_file("src/a.ts", "typescript", "h", 0, 0).unwrap();
+        let fb = db.upsert_file("src/b.ts", "typescript", "h", 0, 0).unwrap();
+        let sa = db.insert_symbol(fa, "alphaFn", "function", None, 1, 0, 2, 0, None).unwrap();
+        let sb = db.insert_symbol(fb, "betaFn", "function", None, 1, 0, 2, 0, None).unwrap();
+
+        // The first model puts alpha next to the query, the second one beta —
+        // and its vectors have another length, as a second model's do.
+        db.upsert_embedding(sa, 0, 1, 2, &unit_vec(4, 0)).unwrap();
+        db.upsert_embedding(sb, 0, 1, 2, &unit_vec(4, 1)).unwrap();
+        assert!(!db.reconcile_upgrade_model("second-model", 6).unwrap());
+        db.upsert_embedding_in(VectorSet::Upgrade, sa, 0, 1, 2, &unit_vec(6, 1)).unwrap();
+        db.upsert_embedding_in(VectorSet::Upgrade, sb, 0, 1, 2, &unit_vec(6, 0)).unwrap();
+
+        let top = |set, query: &[f32]| -> Vec<String> {
+            db.search_hybrid_with_in(set, "", Some(query), 10, &HybridParams::default())
+                .unwrap()
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        };
+        assert_eq!(top(VectorSet::Primary, &unit_vec(4, 0)), ["alphaFn"]);
+        assert_eq!(top(VectorSet::Upgrade, &unit_vec(6, 0)), ["betaFn"]);
+        // A query from the wrong model matches nothing, in either direction.
+        assert!(top(VectorSet::Upgrade, &unit_vec(4, 0)).is_empty());
+        assert!(top(VectorSet::Primary, &unit_vec(6, 0)).is_empty());
+
+        // The counts every caller already reads are the primary set's.
+        assert_eq!(db.index_stats().unwrap().2, 2);
+        assert_eq!(db.upgrade_state().unwrap().vectors, 2);
+        assert_eq!(db.upgrade_model().as_deref(), Some("second-model"));
+        assert_eq!(db.embedding_model().as_deref(), Some(crate::embeddings::MINILM_MODEL_ID));
+    }
+
+    /// When search may move to the upgrade set: not before a pass has covered
+    /// every text file, not with another model's query, and not while it is
+    /// far behind — but a few edited files do not send it back.
+    #[test]
+    fn the_upgrade_set_is_usable_once_complete_and_while_nearly_current() {
+        let db = IndexDb::open(Path::new(":memory:")).expect("open in-memory db");
+        let files: Vec<i64> = (0..30)
+            .map(|i| db.upsert_file(&format!("src/f{i}.rs"), "rust", "v1", 0, 0).unwrap())
+            .collect();
+        db.upsert_file("assets/logo.png", "image", "media:1:1", 0, 0).unwrap();
+
+        let state = db.upgrade_state().unwrap();
+        assert_eq!((state.text_files, state.pending_files, state.complete), (30, 30, false));
+        assert!(!state.usable("m"));
+
+        db.reconcile_upgrade_model("m", 4).unwrap();
+        for id in &files[..29] {
+            db.set_upgrade_hash(*id, "v1").unwrap();
+        }
+        assert!(!db.mark_upgrade_complete().unwrap(), "one file short");
+        assert!(!db.upgrade_state().unwrap().usable("m"));
+        db.set_upgrade_hash(files[29], "v1").unwrap();
+        assert!(db.mark_upgrade_complete().unwrap());
+        let state = db.upgrade_state().unwrap();
+        assert_eq!((state.pending_files, state.complete), (0, true), "the image is not text");
+        assert!(state.usable("m"));
+        assert!(!state.usable("another-model"));
+
+        // Three edited files: still the set to search.
+        for i in 0..3 {
+            db.upsert_file(&format!("src/f{i}.rs"), "rust", "v2", 1, 0).unwrap();
+        }
+        let state = db.upgrade_state().unwrap();
+        assert_eq!(state.pending_files, 3);
+        assert!(state.usable("m"));
+        // One more and it is too far behind — until it has caught up.
+        db.upsert_file("src/f3.rs", "rust", "v2", 1, 0).unwrap();
+        let state = db.upgrade_state().unwrap();
+        assert!(state.complete && !state.usable("m"));
+        assert!(db.mark_upgrade_complete().unwrap(), "falling behind does not undo completeness");
+        for id in &files[..4] {
+            db.set_upgrade_hash(*id, "v2").unwrap();
+        }
+        assert!(db.upgrade_state().unwrap().usable("m"));
+
+        // In a large workspace the allowance is one file in twenty.
+        let many = UpgradeState {
+            model: Some("m".into()),
+            complete: true,
+            pending_files: 50,
+            text_files: 1000,
+            vectors: 0,
+        };
+        assert!(many.usable("m"));
+        assert!(!UpgradeState { pending_files: 51, ..many }.usable("m"));
+    }
+
+    #[test]
+    fn a_different_upgrade_model_starts_the_set_over_and_only_that_set() {
+        let db = IndexDb::open(Path::new(":memory:")).expect("open in-memory db");
+        let file = db.upsert_file("src/a.rs", "rust", "v1", 0, 0).unwrap();
+        let sym = db.insert_symbol(file, "alpha", "function", None, 1, 0, 2, 0, None).unwrap();
+        db.upsert_embedding(sym, 0, 1, 2, &unit_vec(4, 0)).unwrap();
+
+        assert!(!db.reconcile_upgrade_model("m1", 6).unwrap());
+        db.upsert_embedding_in(VectorSet::Upgrade, sym, 0, 1, 2, &unit_vec(6, 0)).unwrap();
+        db.set_upgrade_hash(file, "v1").unwrap();
+        assert!(db.mark_upgrade_complete().unwrap());
+
+        // The same model again: nothing happens.
+        assert!(!db.reconcile_upgrade_model("m1", 6).unwrap());
+        assert!(db.upgrade_state().unwrap().usable("m1"));
+
+        // Another model: the set is emptied and every file queued.
+        assert!(db.reconcile_upgrade_model("m2", 6).unwrap());
+        let state = db.upgrade_state().unwrap();
+        assert_eq!(state.model.as_deref(), Some("m2"));
+        assert_eq!((state.vectors, state.pending_files, state.complete), (0, 1, false));
+        assert!(db.upgrade_hashes().unwrap().is_empty());
+
+        // Vectors of the wrong length under the right name are another
+        // model's too.
+        db.upsert_embedding_in(VectorSet::Upgrade, sym, 0, 1, 2, &unit_vec(8, 0)).unwrap();
+        assert!(db.reconcile_upgrade_model("m2", 6).unwrap());
+        assert_eq!(db.upgrade_state().unwrap().vectors, 0);
+
+        assert_eq!(db.index_stats().unwrap().2, 1, "the primary set was never touched");
+    }
+
+    /// Two servers on one repository share an index. One of them checking
+    /// the index against its models — it reads, then writes — must not fail
+    /// because the other committed in between; and the other may be writing
+    /// for an hour.
+    #[test]
+    fn reconciling_models_survives_another_connection_committing_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let (ours, theirs) = (IndexDb::open(&path).unwrap(), IndexDb::open(&path).unwrap());
+        let file = ours.upsert_file("src/a.rs", "rust", "v0", 0, 0).unwrap();
+        for i in 0..600 {
+            let sym = ours.insert_symbol(file, &format!("f{i}"), "function", None, 1, 0, 2, 0, None).unwrap();
+            ours.upsert_embedding(sym, 0, 1, 2, &unit_vec(384, i % 384)).unwrap();
+        }
+        let profile = ModelProfile::text_only(crate::embeddings::MINILM_MODEL_ID, 384);
+        ours.reconcile_embedding_model(&profile).unwrap();
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut i = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    theirs.upsert_file("src/b.rs", "rust", &format!("v{i}"), i, 0).unwrap();
+                    i += 1;
+                }
+            });
+            let failures: Vec<String> = (0..150)
+                .filter_map(|_| ours.reconcile_embedding_model(&profile).err())
+                .collect();
+            // Before any assertion: a panic in here would leave the other
+            // thread writing for ever.
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(failures.is_empty(), "{} of 150 failed, e.g. {}", failures.len(), failures[0]);
+        });
+        assert_eq!(ours.index_stats().unwrap().2, 600);
+    }
+
+    /// The upgrade checks its model at the start of every turn while the
+    /// watcher writes through a connection of its own: that check must not
+    /// fail because the other connection committed, in either order.
+    #[test]
+    fn checking_the_upgrade_model_survives_another_connection_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let (pass, watcher) = (IndexDb::open(&path).unwrap(), IndexDb::open(&path).unwrap());
+        let file = watcher.upsert_file("src/a.rs", "rust", "v0", 0, 0).unwrap();
+        let sym = watcher.insert_symbol(file, "alpha", "function", None, 1, 0, 2, 0, None).unwrap();
+        assert!(!pass.reconcile_upgrade_model("m1", 6).unwrap());
+        pass.upsert_embedding_in(VectorSet::Upgrade, sym, 0, 1, 2, &unit_vec(6, 0)).unwrap();
+        for i in 0..50 {
+            watcher.upsert_file("src/a.rs", "rust", &format!("v{i}"), i, 0).unwrap();
+            assert!(!pass.reconcile_upgrade_model("m1", 6).unwrap(), "round {i}");
+        }
+        // The change itself, with the other connection still writing.
+        watcher.upsert_file("src/b.rs", "rust", "v0", 0, 0).unwrap();
+        assert!(pass.reconcile_upgrade_model("m2", 6).unwrap());
+        assert_eq!(watcher.upgrade_state().unwrap().vectors, 0);
+        assert_eq!(watcher.upgrade_model().as_deref(), Some("m2"));
+    }
+
+    /// Giving up on a file counts it as done in its current content, and
+    /// only in that content.
+    #[test]
+    fn a_skipped_upgrade_file_is_done_until_it_changes() {
+        let db = IndexDb::open(Path::new(":memory:")).expect("open in-memory db");
+        let file = db.upsert_file("src/a.rs", "rust", "v1", 0, 0).unwrap();
+        db.reconcile_upgrade_model("m", 6).unwrap();
+        assert!(!db.mark_upgrade_complete().unwrap());
+        db.skip_upgrade_file(file).unwrap();
+        assert!(db.mark_upgrade_complete().unwrap());
+        assert_eq!(db.upgrade_hashes().unwrap().get(&file).map(String::as_str), Some("v1"));
+
+        db.upsert_file("src/a.rs", "rust", "v2", 1, 0).unwrap();
+        assert_eq!(db.upgrade_state().unwrap().pending_files, 1);
+        db.skip_upgrade_file(file).unwrap();
+        assert_eq!(db.upgrade_state().unwrap().pending_files, 0);
+        // A file that is not there is nothing to skip.
+        db.skip_upgrade_file(file + 100).unwrap();
+        assert_eq!(db.upgrade_hashes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn re_scanning_or_deleting_a_file_takes_its_upgrade_vectors_along() {
+        let db = IndexDb::open(Path::new(":memory:")).expect("open in-memory db");
+        let file = db.upsert_file("src/a.rs", "rust", "v1", 0, 0).unwrap();
+        let sym = db.insert_symbol(file, "alpha", "function", None, 1, 0, 2, 0, None).unwrap();
+        db.upsert_embedding_in(VectorSet::Upgrade, sym, 0, 1, 2, &unit_vec(6, 0)).unwrap();
+        db.set_upgrade_hash(file, "v1").unwrap();
+
+        // A re-scan replaces the file's symbols: vectors keyed by the old
+        // ones must not survive to be read as the new ones'. Nor may the
+        // record that the file was done — its hash may be the old one again
+        // (an edit, undone), and it has no vectors now.
+        db.delete_symbols_for_file(file).unwrap();
+        let state = db.upgrade_state().unwrap();
+        assert_eq!((state.vectors, state.pending_files), (0, 1));
+        assert!(db.upgrade_hashes().unwrap().is_empty());
+
+        let sym = db.insert_symbol(file, "alpha", "function", None, 1, 0, 2, 0, None).unwrap();
+        db.upsert_embedding_in(VectorSet::Upgrade, sym, 0, 1, 2, &unit_vec(6, 0)).unwrap();
+        db.delete_file("src/a.rs").unwrap();
+        assert_eq!(db.upgrade_state().unwrap().vectors, 0);
+        assert!(db.upgrade_hashes().unwrap().is_empty());
     }
 
     #[test]

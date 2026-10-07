@@ -12,10 +12,12 @@
 //!
 //!   cargo run --release --example semantic_eval -- <workspace_root> [queries.json]
 //!       [--model auto|minilm|embeddinggemma2|both]
-//!                                               default: both — `auto` (what the server runs: MiniLM
-//!                                               for text, EmbeddingGemma 2 beside it for media) and
-//!                                               then `embeddinggemma2` (that model for text as well);
-//!                                               `auto` alone in a candle build
+//!                                               default: both — `auto` (what search runs on until the
+//!                                               background upgrade is done: MiniLM for text,
+//!                                               EmbeddingGemma 2 beside it for media) and then
+//!                                               `embeddinggemma2` (that model for text as well: what
+//!                                               search runs on afterwards); `auto` alone in a candle
+//!                                               build
 //!       [--models-dir <dir>]                    default: the plugin's own cache, so nothing is fetched twice
 //!       [--sweep]                               grid over the fusion gates, one row per combination
 //!       [--no-vector]                           BM25 leg only: the pending-embeddings window

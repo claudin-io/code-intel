@@ -1,4 +1,4 @@
-use crate::db::{FileRecord, IndexDb};
+use crate::db::{FileRecord, IndexDb, VectorSet};
 use crate::embeddings::{
     CodeEmbedder, EmbedChunk, SharedEmbedder, build_embedding_chunks, build_embedding_text,
 };
@@ -920,6 +920,247 @@ pub fn generate_all_embeddings(
     }
 
     Ok((processed, total_embeddings))
+}
+
+/// Chunks per run of the upgrade model. Few on purpose: a run of this model
+/// is seconds long, and a query that needs it — every search, once the
+/// upgrade set is the one searched, and every media search before that —
+/// waits for the run in progress.
+const UPGRADE_BATCH_SIZE: usize = 4;
+
+/// Where a turn of the upgrade takes up and how long it may run.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UpgradeTurn {
+    /// Stop after the file during which this much time has passed. `None`:
+    /// go through everything.
+    pub budget: Option<std::time::Duration>,
+    /// Start after this file — the `last_file` of the turn before. Without
+    /// it, a file that cannot be finished (it keeps changing, or the model
+    /// fails on it) would be where every turn starts and ends.
+    pub after: Option<i64>,
+}
+
+/// What one turn over an index's upgrade set did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UpgradePass {
+    /// Files it embedded.
+    pub files: i64,
+    pub vectors: i64,
+    /// Files it had to leave for a later round: they changed while it was at
+    /// them, or something failed.
+    pub left: i64,
+    /// Of those, the ones the model itself failed on.
+    pub failed: Vec<i64>,
+    /// Files it did not get to within its budget. Zero means the turn went
+    /// through everything there was.
+    pub remaining: i64,
+    /// The last file it took up, for the next turn's `UpgradeTurn::after`.
+    pub last_file: Option<i64>,
+    /// Whether the set has covered the whole workspace — now or before.
+    pub complete: bool,
+}
+
+/// Stand aside while anything holds the indexing semaphore: a first scan and
+/// embedding pass (of any workspace), or the watcher taking in an edit. Those
+/// are what search is waiting for; the upgrade is hours of patience by design.
+fn yield_to_primary_indexing() {
+    while crate::INDEX_SEMAPHORE.available_permits() == 0 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Run `f` at a moment when nothing in this process is in the middle of
+/// writing a file into the index, and keep it that way for as long as `f`
+/// runs. The upgrade reads a file's chunks and stores their vectors seconds
+/// apart, with the watcher free in between; these are the instants at which
+/// it looks, and what it sees then is a file either before an edit or after
+/// it, never halfway.
+fn while_primary_indexing_is_idle<T>(f: impl FnOnce() -> T) -> T {
+    let idle = loop {
+        match crate::INDEX_SEMAPHORE.try_acquire() {
+            Ok(permit) => break permit,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(250)),
+        }
+    };
+    let out = f();
+    drop(idle);
+    out
+}
+
+enum FileUpgrade {
+    /// Embedded, with this many vectors.
+    Done(i64),
+    /// No longer in the index.
+    Gone,
+    /// It changed while its chunks were at the model. Whatever was stored is
+    /// dropped with the old symbols, and the file is still queued.
+    Changed,
+}
+
+/// Embed one file into the upgrade set. `Err` is the model failing.
+fn upgrade_file(db: &IndexDb, embedder: &SharedEmbedder, path: &str) -> Result<Result<FileUpgrade, String>, String> {
+    // The queue may be many minutes old by the time a file's turn comes:
+    // work from what the index says now.
+    let snapshot = while_primary_indexing_is_idle(|| -> Result<_, String> {
+        let Some(file) = db.file_by_path(path)? else {
+            return Ok(None);
+        };
+        let Some(hash) = file.hash.clone() else {
+            return Ok(None);
+        };
+        let chunks = db.chunks_for_file(file.id)?;
+        db.delete_embeddings_for_file_in(VectorSet::Upgrade, file.id)?;
+        Ok(Some((file.id, hash, chunks)))
+    })?;
+    let Some((file_id, hash, chunks)) = snapshot else {
+        return Ok(Ok(FileUpgrade::Gone));
+    };
+    // Still the file that was read: the same row, the same content and the
+    // same chunks under the same symbols. The hash alone would not do — a
+    // file edited and put back has its hash again and new symbols.
+    let unchanged = || -> Result<bool, String> {
+        Ok(db
+            .file_by_path(path)?
+            .is_some_and(|now| now.id == file_id && now.hash.as_deref() == Some(hash.as_str()))
+            && db.chunks_for_file(file_id)? == chunks)
+    };
+
+    for batch in chunks.chunks(UPGRADE_BATCH_SIZE) {
+        yield_to_primary_indexing();
+        let texts: Vec<&str> = batch.iter().map(|c| c.embed_text.as_str()).collect();
+        let encoded = match crate::embeddings::encode_upgrade_documents(embedder, &texts) {
+            Ok(encoded) if encoded.len() == batch.len() => encoded,
+            Ok(encoded) => return Ok(Err(format!("{} vectors for {} chunks", encoded.len(), batch.len()))),
+            Err(e) => return Ok(Err(e)),
+        };
+        // Vectors are stored only for chunks that exist, as they were read,
+        // at the moment of storing: nothing of an older text ever lands
+        // under a newer symbol.
+        let stored = while_primary_indexing_is_idle(|| -> Result<bool, String> {
+            if !unchanged()? {
+                return Ok(false);
+            }
+            for (c, vector) in batch.iter().zip(encoded.iter()) {
+                db.upsert_embedding_in(
+                    VectorSet::Upgrade,
+                    c.symbol_id,
+                    c.chunk_index,
+                    c.start_line,
+                    c.end_line,
+                    vector,
+                )?;
+            }
+            Ok(true)
+        })?;
+        if !stored {
+            return Ok(Ok(FileUpgrade::Changed));
+        }
+        // Same breather as the primary pass, and the gap in which a query
+        // waiting for this model gets its turn.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+
+    let marked = while_primary_indexing_is_idle(|| -> Result<bool, String> {
+        if !unchanged()? {
+            return Ok(false);
+        }
+        db.set_upgrade_hash(file_id, &hash)?;
+        Ok(true)
+    })?;
+    Ok(Ok(if marked {
+        FileUpgrade::Done(chunks.len() as i64)
+    } else {
+        FileUpgrade::Changed
+    }))
+}
+
+/// Fill in the upgrade set (`db::VectorSet::Upgrade`): embed, with the
+/// embedder's upgrade model, every text file the set does not hold in its
+/// current content. The primary set is neither read nor touched.
+///
+/// Built to be interrupted. Progress is recorded file by file, so a process
+/// that exits halfway — this takes tens of minutes on a real repository —
+/// resumes where it stopped. It does not hold the indexing semaphore, so the
+/// watcher keeps taking edits in; it yields to it instead, and looks at the
+/// index only at moments when the watcher is not writing
+/// (`while_primary_indexing_is_idle`). A file that changes while its chunks
+/// are at the model is noticed at the next batch and left for the next round.
+///
+/// With a budget (`UpgradeTurn`), it stops after the file during which the
+/// budget ran out and says how many are `remaining`; the caller calls again,
+/// from `last_file`. That is how several workspaces take turns at the one
+/// model (`UPGRADE_SEMAPHORE`) instead of the first holding it for an hour.
+pub fn generate_upgrade_embeddings(
+    db: &IndexDb,
+    embedder: &SharedEmbedder,
+    progress: Option<ProgressSink<'_>>,
+    workspace: &str,
+    turn: UpgradeTurn,
+) -> Result<UpgradePass, String> {
+    let (model, dim) = embedder
+        .lock()
+        .map_err(|e| format!("embedder lock poisoned: {e}"))?
+        .upgrade_model()
+        .ok_or("no upgrade model is loaded")?;
+    while_primary_indexing_is_idle(|| db.reconcile_upgrade_model(model, dim))?;
+
+    let done = db.upgrade_hashes()?;
+    let is_text = |f: &FileRecord| f.language.as_deref().and_then(MediaKind::parse).is_none();
+    let text_files: Vec<FileRecord> = db
+        .all_files()?
+        .into_iter()
+        .filter(|f| is_text(f) && f.hash.is_some())
+        .collect();
+    // Progress is over the whole workspace, not over this turn's share of it.
+    let total = text_files.len() as i64;
+    let pending: Vec<FileRecord> = text_files
+        .into_iter()
+        .filter(|f| done.get(&f.id) != f.hash.as_ref())
+        .collect();
+    let already = total - pending.len() as i64;
+    let queue: Vec<&FileRecord> = pending
+        .iter()
+        .filter(|f| turn.after.is_none_or(|after| f.id > after))
+        .collect();
+    let started = std::time::Instant::now();
+    let mut pass = UpgradePass::default();
+
+    for (i, queued) in queue.iter().enumerate() {
+        if turn.budget.is_some_and(|b| started.elapsed() >= b) {
+            pass.remaining = (queue.len() - i) as i64;
+            break;
+        }
+        pass.last_file = Some(queued.id);
+        match upgrade_file(db, embedder, &queued.path) {
+            Ok(Ok(FileUpgrade::Done(vectors))) => {
+                pass.files += 1;
+                pass.vectors += vectors;
+            }
+            Ok(Ok(FileUpgrade::Gone)) => {}
+            Ok(Ok(FileUpgrade::Changed)) => pass.left += 1,
+            Ok(Err(e)) => {
+                eprintln!("[embeddings] upgrade model failed on {}: {e}", queued.path);
+                pass.left += 1;
+                pass.failed.push(queued.id);
+            }
+            Err(e) => {
+                eprintln!("[embeddings] upgrade of {} interrupted: {e}", queued.path);
+                pass.left += 1;
+            }
+        }
+        if let Some(p) = progress {
+            p(IndexProgress {
+                status: "upgrading".into(),
+                files_indexed: already + pass.files,
+                symbols_indexed: pass.vectors,
+                total_files: total,
+                workspace: workspace.to_string(),
+            });
+        }
+    }
+
+    pass.complete = db.mark_upgrade_complete()?;
+    Ok(pass)
 }
 
 pub fn reindex_file(

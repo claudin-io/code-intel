@@ -9,7 +9,8 @@
 
 mod workspace;
 
-use claudinio_code_intel::db::SemanticSearchResult;
+use claudinio_code_intel::db::{SemanticSearchResult, VectorSet};
+use claudinio_code_intel::embeddings;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
@@ -18,7 +19,7 @@ use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use workspace::{Phase, Workspace};
+use workspace::{Phase, PipelineOptions, UpgradeStage, Workspace};
 
 const SNIPPET_TOP_HITS: usize = 5;
 const SNIPPET_MAX_LINES: usize = 40;
@@ -35,7 +36,7 @@ const MODEL_WAIT_MS: u64 = 5000;
 #[derive(Clone)]
 struct Options {
     cache_dir: PathBuf,
-    embeddings: bool,
+    pipeline: PipelineOptions,
 }
 
 #[derive(Clone)]
@@ -155,12 +156,37 @@ fn attach_snippets(results: &mut [SemanticSearchResult]) {
     }
 }
 
-/// The model the workspace's vectors come from: the loaded embedder's, or —
-/// before it has loaded — whatever the index on disk was built with.
+/// The model whose vectors a text search is ranked with right now: the
+/// upgrade set's once search has moved to it, otherwise the loaded
+/// embedder's, or — before it has loaded — whatever the index on disk was
+/// built with.
 fn embedding_model(ws: &Workspace) -> Option<String> {
+    if ws.text_set() == VectorSet::Upgrade {
+        return ws.db.upgrade_model();
+    }
     ws.current_embedder()
         .and_then(|e| e.lock().ok().map(|g| g.model_id().to_string()))
         .or_else(|| ws.db.embedding_model())
+}
+
+/// The background upgrade of the workspace's text vectors: what it is doing
+/// (`state`), how much of the workspace the second set holds, and whether
+/// search is using it yet (`searching`).
+fn upgrade_status(ws: &Workspace) -> serde_json::Value {
+    let stage = ws.upgrade_stage();
+    if stage == UpgradeStage::Off {
+        return serde_json::json!({ "state": stage.as_str() });
+    }
+    let state = ws.db.upgrade_state().unwrap_or_default();
+    serde_json::json!({
+        "state": stage.as_str(),
+        "model": state.model,
+        "searching": ws.text_set() == VectorSet::Upgrade,
+        "files": state.text_files,
+        "filesPending": state.pending_files,
+        "embeddings": state.vectors,
+        "progress": ws.upgrade_progress.lock().ok().and_then(|p| p.clone()),
+    })
 }
 
 /// Images and audio in the index, how many have a content vector (the rest
@@ -246,13 +272,15 @@ impl CodeIntel {
                 return Ok(ws.clone());
             }
         }
-        let ws = Workspace::open(root.clone(), &self.opts.cache_dir)?;
+        let ws = Workspace::open(root.clone(), &self.opts.cache_dir, self.opts.pipeline)?;
         self.workspaces.write().await.push(ws.clone());
         tracing::info!(root = %root.display(), db = %ws.db_path.display(), "workspace opened");
-        tokio::spawn(
-            ws.clone()
-                .run_pipeline(self.opts.cache_dir.clone(), self.opts.embeddings),
-        );
+        let cache_dir = self.opts.cache_dir.clone();
+        let background = ws.clone();
+        tokio::spawn(async move {
+            background.clone().run_pipeline(cache_dir).await;
+            background.run_upgrade_worker().await;
+        });
         Ok(ws)
     }
 
@@ -339,7 +367,7 @@ impl CodeIntel {
 impl CodeIntel {
     #[tool(
         name = "index_status",
-        description = "State of the local code index: phase (indexing | embedding | lexical_only | ready | failed), scan/embedding progress, counts of indexed files, symbols and embeddings, the embedding model in use, and how many image/audio files are indexed (media.state: loading | embedding | ready when they are being given content vectors by the media model, name-only when they match by file name only). Call this when a search tool says the index is not ready."
+description = "State of the local code index: phase (indexing | embedding | lexical_only | ready | failed), scan/embedding progress, counts of indexed files, symbols and embeddings, the embedding model search is using, how many image/audio files are indexed (media.state: loading | embedding | ready when they are being given content vectors by the media model, name-only when they match by file name only), and the background upgrade to the larger text model (upgrade.state: waiting | loading | embedding | ready | unavailable | off; upgrade.searching says whether search has moved to it — until then it runs on the first model, which is complete once phase is ready). Call this when a search tool says the index is not ready."
     )]
     async fn index_status(
         &self,
@@ -364,6 +392,7 @@ impl CodeIntel {
                 "embeddings": embeddings,
                 "embeddingsPending": ws.db.embedding_pending_files().unwrap_or(0),
                 "embeddingModel": embedding_model(&ws),
+                "upgrade": upgrade_status(&ws),
                 "media": media_status(&ws),
                 "watcherWarning": ws.watcher_warning.lock().ok().and_then(|w| w.clone()),
                 "error": ws.error.lock().ok().and_then(|e| e.clone()),
@@ -457,33 +486,59 @@ impl CodeIntel {
         // Media vectors answer to a differently-prefixed query, so that one
         // is only computed when the index has media vectors to compare it to.
         let want_media_vec = ws.db.media_embedding_count().unwrap_or(0) > 0;
-        let (query_vec, media_vec): (Option<Vec<f32>>, Option<Vec<f32>>) = match model {
+        let (set, query_vec, media_vec): (VectorSet, Option<Vec<f32>>, Option<Vec<f32>>) = match model {
             Some(model) => {
                 let q = p.query.clone();
+                let chooser = ws.clone();
                 let vecs = tokio::task::spawn_blocking(move || {
-                    let mut m = model.lock().map_err(|e| format!("embedder lock: {e}"))?;
-                    let code = m.encode_query(&q)?;
-                    let media = if want_media_vec { m.encode_media_query(&q)? } else { None };
-                    Ok::<_, String>((code, media))
+                    // Which of the index's two sets of text vectors to rank
+                    // with; the query has to be embedded by the model that
+                    // wrote it. Decided here, off the async threads: it
+                    // looks at the embedder, which the watcher may be
+                    // holding for a file.
+                    let (set, code) = match chooser.text_set() {
+                        VectorSet::Upgrade => match embeddings::encode_upgrade_query(&model, &q) {
+                            Ok(code) => (VectorSet::Upgrade, code),
+                            // The first model's vectors are all still there.
+                            Err(e) => {
+                                tracing::warn!("upgrade model failed on a query, using the first model: {e}");
+                                (VectorSet::Primary, embeddings::encode_query(&model, &q)?)
+                            }
+                        },
+                        VectorSet::Primary => (VectorSet::Primary, embeddings::encode_query(&model, &q)?),
+                    };
+                    let media = if want_media_vec {
+                        embeddings::encode_media_query(&model, &q).unwrap_or_else(|e| {
+                            tracing::warn!("media query embedding failed, media by name only: {e}");
+                            None
+                        })
+                    } else {
+                        None
+                    };
+                    Ok::<_, String>((set, code, media))
                 })
                 .await
                 .map_err(|e| format!("encode task panicked: {e}"))?;
                 match vecs {
-                    Ok((code, media)) => (Some(code), media),
+                    Ok((set, code, media)) => (set, Some(code), media),
                     Err(e) => {
                         tracing::warn!("query embedding failed, lexical only: {e}");
-                        (None, None)
+                        (VectorSet::Primary, None, None)
                     }
                 }
             }
-            None => (None, None),
+            None => (VectorSet::Primary, None, None),
         };
 
-        let mut results = ws.db.search_hybrid(&p.query, query_vec.as_deref(), limit)?;
+        let mut results = ws.db.search_hybrid_in(set, &p.query, query_vec.as_deref(), limit)?;
         attach_snippets(&mut results);
         let media = ws.db.search_media(&p.query, media_vec.as_deref(), MEDIA_HITS)?;
 
-        let pending = ws.db.embedding_pending_files().unwrap_or(0);
+        // What the vectors that ranked this search are still missing.
+        let pending = match set {
+            VectorSet::Primary => ws.db.embedding_pending_files().unwrap_or(0),
+            VectorSet::Upgrade => ws.db.upgrade_state().map(|s| s.pending_files).unwrap_or(0),
+        };
         let mode = if query_vec.is_some() { "hybrid" } else { "lexical-only" };
         let note = if query_vec.is_none() {
             Some(if pending > 0 {
@@ -519,7 +574,7 @@ impl ServerHandler for CodeIntel {
                 Implementation::new("claudinio-code-intel", env!("CARGO_PKG_VERSION"))
                     .with_title("Claudinio Code Intel")
                     .with_description(
-                        "Local hybrid code search: tree-sitter symbols + BM25 + embeddings (MiniLM for code and docs; EmbeddingGemma 2 for images and audio). Nothing leaves the machine.",
+                        "Local hybrid code search: tree-sitter symbols + BM25 + embeddings (MiniLM at once, EmbeddingGemma 2 taking over in the background and for images and audio). Nothing leaves the machine.",
                     )
                     .with_website_url("https://github.com/claudin-io/code-intel"),
             )
@@ -531,7 +586,9 @@ impl ServerHandler for CodeIntel {
                  call — some hosts never tell the server which directory you are working in, and \
                  a tool then answers \"no workspace open\". If a tool reports the index is not \
                  ready, call index_status and retry — the first scan takes seconds, embeddings run \
-                 for a few minutes in the background and search works lexically meanwhile.",
+                 for a few minutes in the background and search works lexically meanwhile. A \
+                 larger model then re-embeds the project in the background, for up to an hour or \
+                 two; search does not wait for it and needs nothing from you when it takes over.",
             )
     }
 
@@ -572,12 +629,14 @@ fn usage() -> ! {
         "claudinio-code-intel {}\n\n\
          MCP server (stdio) for local hybrid code search.\n\n\
          USAGE: claudinio-code-intel [--workspace <dir>]... [--cache-dir <dir>] [--no-embeddings]\n\
-         \x20      claudinio-code-intel index [--workspace <dir>] [--cache-dir <dir>] [--no-embeddings]\n\n\
+         \x20      claudinio-code-intel index [--workspace <dir>] [--cache-dir <dir>] [--no-embeddings] [--upgrade]\n\n\
          The workspace defaults to $CODE_INTEL_WORKSPACE, then the cwd; the client's MCP roots\n\
-         are indexed too. `index` builds the index and exits (warm a cache in CI, or debug).\n\
+         are indexed too. `index` builds the index and exits (warm a cache in CI, or debug);\n\
+         with --upgrade it also runs the background upgrade to completion first, however long\n\
+         that takes.\n\
          Env: CODE_INTEL_CACHE_DIR, CODE_INTEL_EMBEDDINGS=0, CODE_INTEL_LOG=<filter>,\n\
-         \x20    CODE_INTEL_MODEL=auto|minilm|embeddinggemma2, CODE_INTEL_MEDIA=0,\n\
-         \x20    CODE_INTEL_THREADS=<n>.\n\
+         \x20    CODE_INTEL_MODEL=auto|minilm|embeddinggemma2, CODE_INTEL_UPGRADE=0,\n\
+         \x20    CODE_INTEL_MEDIA=0, CODE_INTEL_THREADS=<n>.\n\
          Cache: {}",
         env!("CARGO_PKG_VERSION"),
         workspace::default_cache_dir().display()
@@ -589,6 +648,8 @@ struct Cli {
     workspaces: Vec<PathBuf>,
     opts: Options,
     index_only: bool,
+    /// `index --upgrade`: do not exit before the upgrade set is complete.
+    index_upgrade: bool,
 }
 
 fn parse_args() -> Cli {
@@ -599,11 +660,10 @@ fn parse_args() -> Cli {
             cache_dir: std::env::var_os("CODE_INTEL_CACHE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(workspace::default_cache_dir),
-            embeddings: std::env::var("CODE_INTEL_EMBEDDINGS")
-                .map(|v| v != "0")
-                .unwrap_or(true),
+            pipeline: PipelineOptions::from_env(),
         },
         index_only: false,
+        index_upgrade: false,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -619,7 +679,8 @@ fn parse_args() -> Cli {
             "--cache-dir" => {
                 cli.opts.cache_dir = PathBuf::from(args.next().unwrap_or_else(|| usage()))
             }
-            "--no-embeddings" => cli.opts.embeddings = false,
+            "--no-embeddings" => cli.opts.pipeline.embeddings = false,
+            "--upgrade" => cli.index_upgrade = true,
             "--version" | "-V" => {
                 println!("claudinio-code-intel {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0)
@@ -696,10 +757,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .first()
             .cloned()
             .unwrap_or(std::env::current_dir()?);
-        let ws = Workspace::open(canonical(&root), &cli.opts.cache_dir)?;
-        ws.clone()
-            .run_pipeline(cli.opts.cache_dir.clone(), cli.opts.embeddings)
-            .await;
+        let ws = Workspace::open(canonical(&root), &cli.opts.cache_dir, cli.opts.pipeline)?;
+        ws.clone().run_pipeline(cli.opts.cache_dir.clone()).await;
+        if cli.index_upgrade {
+            ws.upgrade_once().await;
+        }
         let (files, symbols, embeddings) = ws.db.index_stats().unwrap_or((0, 0, 0));
         println!(
             "{}",
@@ -707,6 +769,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "workspace": ws.root, "phase": ws.phase(),
                 "files": files, "symbols": symbols, "embeddings": embeddings,
                 "embeddingModel": embedding_model(&ws),
+                "upgrade": upgrade_status(&ws),
                 "media": media_status(&ws),
                 "indexDb": ws.db_path,
                 "error": ws.error.lock().ok().and_then(|e| e.clone()),
@@ -743,7 +806,14 @@ mod tests {
     use super::*;
 
     fn opts(dir: &Path) -> Options {
-        Options { cache_dir: dir.join("cache"), embeddings: false }
+        Options {
+            cache_dir: dir.join("cache"),
+            pipeline: PipelineOptions {
+                embeddings: false,
+                model: embeddings::ModelChoice::Auto,
+                upgrade: true,
+            },
+        }
     }
 
     /// Copilot starts the server with cwd = the plugin's own install dir and

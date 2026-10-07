@@ -66,7 +66,10 @@ grep as the fallback. Reach for grep when you need every textual occurrence
 ## When the index is not ready
 
 The first scan of a workspace takes seconds; embeddings run for a few minutes
-in the background. A tool that answers `index not ready: N of M files
+in the background. After that a larger model re-embeds the project, for up to
+an hour or two, and search moves to it on its own: there is nothing to wait
+for and nothing to do, results are complete throughout. `index_status` shows
+it under `upgrade`. A tool that answers `index not ready: N of M files
 scanned` is telling you to call `index_status`, then retry, or use grep for
 this one question. `phase: "failed"` with an `error` means the scan itself
 broke — report it rather than retrying forever.

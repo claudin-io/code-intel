@@ -280,13 +280,13 @@ fn real_model_ranks_code_images_and_audio() {
         assert_eq!(guard.media_support(), needs);
     }
     let t = Instant::now();
-    let doc_vecs = paired.lock().unwrap().encode(&docs).expect("encode documents");
+    let minilm_doc_vecs = paired.lock().unwrap().encode(&docs).expect("encode documents");
     say!("{} code chunks on MiniLM: {:.2}s", docs.len(), t.elapsed().as_secs_f32());
-    assert_eq!(doc_vecs[0].len(), embeddings::MINILM_DIM);
+    assert_eq!(minilm_doc_vecs[0].len(), embeddings::MINILM_DIM);
     say!("code on MiniLM  (rows: queries, columns: documents)");
     for q in &queries {
         let qv = paired.lock().unwrap().encode_query(q).expect("encode query");
-        let scores: Vec<f32> = doc_vecs.iter().map(|d| dot(&qv, d)).collect();
+        let scores: Vec<f32> = minilm_doc_vecs.iter().map(|d| dot(&qv, d)).collect();
         // Printed, not asserted: MiniLM's ranking is not what this branch
         // changes, and its eval is `examples/semantic_eval.rs`.
         say!("  {scores:.3?}  {q}");
@@ -311,4 +311,28 @@ fn real_model_ranks_code_images_and_audio() {
         scores.iter().cloned().fold(f32::MIN, f32::max),
         "{scores:?}"
     );
+
+    // And so does the text upgrade: what it writes into an index's second
+    // set of vectors, and the queries it ranks them with, are exactly what
+    // EmbeddingGemma 2 gave as the text model at the top of this test.
+    assert!(
+        rt.block_on(embeddings::ensure_text_upgrade(&paired)),
+        "the model beside MiniLM is the upgrade model"
+    );
+    let t = Instant::now();
+    let upgraded = embeddings::encode_upgrade_documents(&paired, &docs).expect("encode for the upgrade set");
+    say!(
+        "\n{} code chunks for the upgrade set: {:.2}s",
+        docs.len(),
+        t.elapsed().as_secs_f32()
+    );
+    for (i, (upgrade, text)) in upgraded.iter().zip(&doc_vecs).enumerate() {
+        assert!(dot(upgrade, text) > 0.999, "document {i} embeds differently as an upgrade");
+    }
+    for (qi, q) in queries.iter().enumerate() {
+        let qv = embeddings::encode_upgrade_query(&paired, q).expect("encode upgrade query");
+        let scores: Vec<f32> = upgraded.iter().map(|d| dot(&qv, d)).collect();
+        let best = scores.iter().cloned().fold(f32::MIN, f32::max);
+        assert_eq!(scores[qi], best, "upgrade query {qi} ({q}): {scores:?}");
+    }
 }
