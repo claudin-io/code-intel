@@ -287,9 +287,6 @@ const TEST_FILE_PENALTY: f32 = 0.10;
 /// large file (many symbols) can't dominate the whole ranking.
 const MAX_RESULTS_PER_FILE: usize = 3;
 
-/// Number of embedding rows loaded per page in the paginated semantic scan.
-const EMBEDDING_PAGE_SIZE: i64 = 2000;
-
 const STOPWORDS: &[&str] = &["the", "and", "for", "with"];
 
 /// Lowercase, alphanumeric tokens of at least 3 chars, minus trivial stopwords.
@@ -1551,29 +1548,19 @@ impl IndexDb {
         page_size: i64,
         offset: i64,
     ) -> Result<Vec<EmbeddingRow>, String> {
-        self.load_embeddings_page_in(VectorSet::Primary, page_size, offset)
-    }
-
-    pub fn load_embeddings_page_in(
-        &self,
-        set: VectorSet,
-        page_size: i64,
-        offset: i64,
-    ) -> Result<Vec<EmbeddingRow>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
-            .prepare(&format!(
+            .prepare(
                 "SELECT s.id, s.file_id, s.name, s.kind, s.signature,
                         s.start_line, s.start_col, s.end_line, s.end_col, f.path,
                         e.start_line, e.end_line, e.embedding
                  FROM symbols s
                  JOIN files f ON f.id = s.file_id
-                 JOIN {} e ON e.symbol_id = s.id
+                 JOIN symbol_embeddings e ON e.symbol_id = s.id
                  WHERE s.kind NOT IN ('image','audio')
                  ORDER BY s.id, e.start_line
                  LIMIT ? OFFSET ?",
-                set.table()
-            ))
+            )
             .map_err(|e| format!("prepare: {e}"))?;
         let results = stmt
             .query_map(params![page_size, offset], |row| {
@@ -1608,8 +1595,22 @@ impl IndexDb {
         Ok(results)
     }
 
-    /// Vector leg: paginated cosine scan of every embedded chunk, gated at
-    /// `min_cosine`, reduced to the best chunk per symbol, ranked by cosine.
+    /// Vector leg: cosine of the query against every embedded chunk of one
+    /// set, gated at `min_cosine`, reduced to the best chunk per symbol,
+    /// ranked by cosine.
+    ///
+    /// Two steps, because this runs on every search. The scan reads nothing
+    /// but the vectors — straight out of SQLite's pages, with no join and no
+    /// allocation per row — and only the `k` symbols that survive it are then
+    /// looked up by name and path. Loading every row with its symbol and file
+    /// first took 0.85 s over 15.7k chunks of 384 dimensions, and 1.0 s over
+    /// the same chunks at 768.
+    ///
+    /// Vectors of another length are another model's and are skipped; so are
+    /// media vectors, which `search_media` ranks apart: their scores against
+    /// a text query sit on another scale. Ties are broken by symbol id — a
+    /// repository full of identical test helpers has many — so that the same
+    /// search returns the same ranks twice.
     fn vector_leg_candidates(
         &self,
         set: VectorSet,
@@ -1617,62 +1618,107 @@ impl IndexDb {
         min_cosine: f32,
         k: usize,
     ) -> Result<Vec<LegHit>, String> {
-        let mut best_per_symbol: std::collections::HashMap<i64, LegHit> =
-            std::collections::HashMap::new();
-        let mut offset: i64 = 0;
-        loop {
-            let page = self.load_embeddings_page_in(set, EMBEDDING_PAGE_SIZE, offset)?;
-            let page_len = page.len();
-            if page.is_empty() {
-                break;
-            }
-            for (sym, chunk_start, chunk_end, emb) in page {
-                if emb.len() != query_vec.len() {
-                    continue;
-                }
-                let dot: f32 = query_vec.iter().zip(emb.iter()).map(|(a, b)| a * b).sum();
+        struct Best {
+            cosine: f32,
+            chunk_start: i64,
+            chunk_end: i64,
+        }
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut best_per_symbol: std::collections::HashMap<i64, Best> = std::collections::HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT e.symbol_id, e.start_line, e.end_line, e.embedding
+                     FROM {} e
+                     WHERE length(e.embedding) = ?1
+                       AND e.symbol_id NOT IN (SELECT id FROM symbols WHERE kind IN ({MEDIA_KINDS_SQL}))",
+                    set.table()
+                ))
+                .map_err(|e| format!("prepare vector scan: {e}"))?;
+            let mut rows = stmt
+                .query(params![(query_vec.len() * 4) as i64])
+                .map_err(|e| format!("query vector scan: {e}"))?;
+            while let Some(row) = rows.next().map_err(|e| format!("vector scan: {e}"))? {
+                let blob = row
+                    .get_ref(3)
+                    .and_then(|v| v.as_blob().map_err(Into::into))
+                    .map_err(|e| format!("vector scan: {e}"))?;
+                let dot: f32 = blob
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(query_vec.iter())
+                    .map(|(bytes, q)| f32::from_le_bytes(*bytes) * q)
+                    .sum();
                 let cosine = dot.clamp(0.0, 1.0);
                 if cosine < min_cosine {
                     continue;
                 }
-                let hit = LegHit {
-                    symbol_id: sym.id,
-                    name: sym.name,
-                    kind: sym.kind,
-                    signature: sym.signature,
-                    file_path: sym.file_path.unwrap_or_default(),
-                    sym_start_line: sym.start_line,
-                    sym_end_line: sym.end_line,
+                let symbol_id: i64 = row.get(0).map_err(|e| format!("vector scan: {e}"))?;
+                let chunk_start: i64 = row.get(1).map_err(|e| format!("vector scan: {e}"))?;
+                let chunk_end: i64 = row.get(2).map_err(|e| format!("vector scan: {e}"))?;
+                let candidate = Best {
+                    cosine,
                     chunk_start,
                     chunk_end,
-                    cosine,
-                    fts_text: String::new(),
                 };
-                match best_per_symbol.entry(hit.symbol_id) {
+                match best_per_symbol.entry(symbol_id) {
                     std::collections::hash_map::Entry::Occupied(mut e) => {
-                        if hit.cosine > e.get().cosine {
-                            e.insert(hit);
+                        // Of two equally good chunks of a symbol, the one
+                        // higher up in the file — whatever order the rows
+                        // came in.
+                        let held = e.get();
+                        if cosine > held.cosine || (cosine == held.cosine && chunk_start < held.chunk_start) {
+                            e.insert(candidate);
                         }
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(hit);
+                        e.insert(candidate);
                     }
                 }
             }
-            // Advance the cursor by the actual number of rows read; a short
-            // page means there are no more rows.
-            offset += page_len as i64;
-            if (page_len as i64) < EMBEDDING_PAGE_SIZE {
-                break;
+        }
+
+        let mut ranked: Vec<(i64, Best)> = best_per_symbol.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            b.1.cosine
+                .partial_cmp(&a.1.cosine)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        ranked.truncate(k);
+
+        let mut lookup = conn
+            .prepare(
+                "SELECT s.name, s.kind, s.signature, f.path, s.start_line, s.end_line
+                 FROM symbols s
+                 JOIN files f ON f.id = s.file_id
+                 WHERE s.id = ?1",
+            )
+            .map_err(|e| format!("prepare vector hits: {e}"))?;
+        let mut hits: Vec<LegHit> = Vec::with_capacity(ranked.len());
+        for (symbol_id, best) in ranked {
+            let hit = lookup.query_row(params![symbol_id], |row| {
+                Ok(LegHit {
+                    symbol_id,
+                    name: row.get(0)?,
+                    kind: row.get(1)?,
+                    signature: row.get(2)?,
+                    file_path: row.get(3)?,
+                    sym_start_line: row.get(4)?,
+                    sym_end_line: row.get(5)?,
+                    chunk_start: best.chunk_start,
+                    chunk_end: best.chunk_end,
+                    cosine: best.cosine,
+                    fts_text: String::new(),
+                })
+            });
+            // A symbol can only be missing if another connection deleted it
+            // since the scan a moment ago; it is no longer a result.
+            if let Ok(hit) = hit {
+                hits.push(hit);
             }
         }
-        let mut hits: Vec<LegHit> = best_per_symbol.into_values().collect();
-        hits.sort_by(|a, b| {
-            b.cosine
-                .partial_cmp(&a.cosine)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        hits.truncate(k);
         Ok(hits)
     }
 
@@ -2561,6 +2607,47 @@ mod tests {
         .unwrap();
         db.set_embed_hash(file_id, "h1").unwrap();
         assert_eq!(db.embedding_pending_files().unwrap(), 0);
+    }
+
+    /// What the vector leg promises beyond "the nearest chunks": media and
+    /// another model's vectors are not candidates, and equal scores — a
+    /// repository has many identical helpers — rank the same way every time.
+    #[test]
+    fn vector_leg_skips_media_and_foreign_vectors_and_breaks_ties_by_symbol() {
+        let db = IndexDb::open(Path::new(":memory:")).expect("open in-memory db");
+        let code = db.upsert_file("src/a.rs", "rust", "h", 0, 0).unwrap();
+        let image = db.upsert_file("assets/logo.png", "image", "media:1:1", 0, 0).unwrap();
+        let symbol = |file, name: &str, kind: &str| db.insert_symbol(file, name, kind, None, 1, 0, 40, 0, None).unwrap();
+        let twin_a = symbol(code, "twin_a", "function");
+        let twin_b = symbol(code, "twin_b", "function");
+        let long = symbol(code, "long_fn", "function");
+        let other_model = symbol(code, "other_model", "function");
+        let logo = symbol(image, "logo.png", "image");
+
+        let query = unit_vec(4, 0);
+        let near = vec![0.8f32, 0.6, 0.0, 0.0];
+        // Stored in the order that would win if order decided anything.
+        db.upsert_embedding(twin_b, 0, 1, 5, &near).unwrap();
+        db.upsert_embedding(twin_a, 0, 1, 5, &near).unwrap();
+        // Two equally good chunks of one symbol, the lower one first.
+        db.upsert_embedding(long, 1, 21, 40, &query).unwrap();
+        db.upsert_embedding(long, 0, 1, 20, &query).unwrap();
+        // A perfect match that is a picture, and one of another length.
+        db.upsert_embedding(logo, 0, 0, 0, &query).unwrap();
+        db.upsert_embedding(other_model, 0, 1, 5, &unit_vec(6, 0)).unwrap();
+
+        let hits = db.vector_leg_candidates(VectorSet::Primary, &query, 0.1, 10).unwrap();
+        let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["long_fn", "twin_a", "twin_b"]);
+        assert_eq!((hits[0].chunk_start, hits[0].chunk_end), (1, 20), "the chunk higher up");
+        assert_eq!(hits[0].file_path, "src/a.rs");
+
+        // The cut falls between the twins: always on the same side.
+        let two = db.vector_leg_candidates(VectorSet::Primary, &query, 0.1, 2).unwrap();
+        assert_eq!(two.iter().map(|h| h.symbol_id).collect::<Vec<_>>(), [long, twin_a]);
+        // And the gate applies to what is left.
+        let gated = db.vector_leg_candidates(VectorSet::Primary, &query, 0.9, 10).unwrap();
+        assert_eq!(gated.len(), 1);
     }
 
     /// The two sets hold vectors of different models for the same chunks: a
