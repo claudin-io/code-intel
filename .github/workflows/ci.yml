@@ -119,10 +119,19 @@ jobs:
       - name: Build
         shell: bash
         run: cargo build -p claudinio-code-intel-mcp --target ${{ matrix.target }} $BACKEND_ARGS
+      # A job's log can only be read signed in; its annotations cannot. So
+      # when tests fail, what failed is repeated as an annotation.
       - name: Test
         if: matrix.test
         shell: bash
-        run: cargo test --workspace --target ${{ matrix.target }} $BACKEND_ARGS
+        run: |
+          set -o pipefail
+          if ! cargo test --workspace --no-fail-fast --target ${{ matrix.target }} $BACKEND_ARGS 2>&1 | tee test.log; then
+            { grep -E "^test .* FAILED$|^error" test.log; grep -E -A4 "panicked at" test.log; } \
+              | head -80 | cut -c1-300 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}' > failures.txt
+            echo "::error title=Failing tests (${{ matrix.name }})::$(cat failures.txt)"
+            exit 1
+          fi
 
   # The real EmbeddingGemma 2 weights: download, load, and check that code,
   # images and audio are ranked sensibly. Everything else in CI runs against
@@ -146,6 +155,14 @@ jobs:
       - run: cargo test -p claudinio-code-intel --test gemma2_e2e -- --ignored --nocapture
         env:
           CODE_INTEL_E2E_MODELS: ${{ github.workspace }}/.e2e-models
+          CODE_INTEL_E2E_REPORT: ${{ github.workspace }}/e2e-report.txt
+      # Scores and timings, where they can be read without the log.
+      - name: Report
+        if: always()
+        run: |
+          [ -f e2e-report.txt ] || exit 0
+          { echo '```'; cat e2e-report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=EmbeddingGemma 2 on real weights::$(sed 's/%/%25/g' e2e-report.txt | awk '{printf "%s%%0A", $0}')"
 
   # Search quality on real queries, per model: the rank of the expected file
   # for each query, the raw cosine distributions, a sweep over the fusion
@@ -184,6 +201,27 @@ jobs:
         if: always()
         run: |
           { echo '```'; cat eval-report.txt 2>/dev/null || echo 'no report was produced'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # The same report as annotations, which need no sign-in to read: the
+      # queries that ranked first are left out (they are in the summary and
+      # the artifact), the rest is cut into pieces an annotation can hold. A
+      # step keeps ten notices, hence two steps.
+      - name: Report as annotations (1/2)
+        if: always()
+        run: |
+          [ -f eval-report.txt ] || exit 0
+          grep -v '^\[rank=1\]' eval-report.txt > eval-brief.txt
+          split -C 3000 -d -a 2 eval-brief.txt part.
+          for f in part.0?; do
+            [ -f "$f" ] || continue
+            echo "::notice title=Eval report ${f#part.}::$(sed 's/%/%25/g' "$f" | awk '{printf "%s%%0A", $0}')"
+          done
+      - name: Report as annotations (2/2)
+        if: always()
+        run: |
+          for f in part.1?; do
+            [ -f "$f" ] || continue
+            echo "::notice title=Eval report ${f#part.}::$(sed 's/%/%25/g' "$f" | awk '{printf "%s%%0A", $0}')"
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
