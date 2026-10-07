@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Run the whole thing, platform matrix included, on any branch by hand.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,6 +42,154 @@ jobs:
           | timeout 120 cargo run -q -p claudinio-code-intel-mcp ${{ matrix.args }} -- --no-embeddings --workspace . \
           | tee /tmp/mcp.out
           grep -q '"name":"semantic_search"' /tmp/mcp.out
+
+  # Every target a release ships (keep in step with release.yml), built on
+  # each pull request instead of only when a tag is pushed — and tested
+  # wherever the runner can execute what it built. A dependency that does not
+  # compile on Windows, or a decoder that misbehaves on macOS, shows up here
+  # and not on release day.
+  platforms:
+    name: ${{ matrix.name }}
+    if: github.event_name != 'push'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            test: true
+          - name: linux-x64-baseline
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            candle: true
+            test: true
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            test: true
+          - name: darwin-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            test: true
+          - name: darwin-x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            candle: true
+            test: true
+          - name: win32-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            test: true
+          - name: win32-x64-baseline
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            candle: true
+            test: true
+          # Cross-compiled on an x64 runner: built, not run.
+          - name: win32-arm64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: Windows CRT
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "RUSTFLAGS=-Ctarget-feature=-crt-static" >> "$GITHUB_ENV"
+      - name: Baseline codegen (Linux candle)
+        if: matrix.candle && runner.os == 'Linux'
+        shell: bash
+        run: echo "RUSTFLAGS=-Ctarget-cpu=x86-64" >> "$GITHUB_ENV"
+      - name: Backend
+        shell: bash
+        run: |
+          if [ "${{ matrix.candle }}" = "true" ]; then
+            echo "BACKEND_ARGS=--no-default-features --features embeddings-candle" >> "$GITHUB_ENV"
+          fi
+      - name: Build
+        shell: bash
+        run: cargo build -p claudinio-code-intel-mcp --target ${{ matrix.target }} $BACKEND_ARGS
+      - name: Test
+        if: matrix.test
+        shell: bash
+        run: cargo test --workspace --target ${{ matrix.target }} $BACKEND_ARGS
+
+  # The real EmbeddingGemma 2 weights: download, load, and check that code,
+  # images and audio are ranked sensibly. Everything else in CI runs against
+  # a stand-in model, so this is the job that notices a re-exported graph or
+  # a preprocessing bug. Its log has the scores and per-file timings.
+  model:
+    name: EmbeddingGemma 2 (real weights)
+    if: github.event_name != 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ort
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: actions/cache@v4
+        with:
+          path: .e2e-models
+          key: embeddinggemma2-${{ hashFiles('crates/code-intel/src/gemma2.rs') }}
+      - run: cargo test -p claudinio-code-intel --test gemma2_e2e -- --ignored --nocapture
+        env:
+          CODE_INTEL_E2E_MODELS: ${{ github.workspace }}/.e2e-models
+
+  # Search quality on real queries, per model: the rank of the expected file
+  # for each query, the raw cosine distributions, a sweep over the fusion
+  # gates and the indexing speed. The workspace is Claudinio Code at a pinned
+  # commit — the repository the query set was written against. The report is
+  # the job summary; `GEMMA2_MIN_COSINE_CANDIDATE` and `MEDIA_MIN_COSINE` in
+  # db.rs are set from it.
+  eval:
+    name: Search quality (MiniLM vs EmbeddingGemma 2)
+    if: github.event_name != 'push'
+    runs-on: ubuntu-24.04
+    env:
+      EVAL_REPO: https://github.com/claudin-io/claudinio-code
+      EVAL_COMMIT: 9374045be14ba1544093cdac079dbb2c2cc2e088
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ort-release
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: Evaluated workspace
+        run: |
+          git init -q "$RUNNER_TEMP/workspace"
+          git -C "$RUNNER_TEMP/workspace" fetch -q --depth 1 "$EVAL_REPO" "$EVAL_COMMIT"
+          git -C "$RUNNER_TEMP/workspace" checkout -q FETCH_HEAD
+      - uses: actions/cache@v4
+        with:
+          path: .e2e-models
+          key: eval-models-${{ hashFiles('crates/code-intel/src/gemma2.rs', 'crates/code-intel/src/embeddings.rs') }}
+      - name: Eval
+        run: |
+          cargo run --release -p claudinio-code-intel --example semantic_eval -- \
+            "$RUNNER_TEMP/workspace" --models-dir .e2e-models --sweep --report eval-report.txt
+      - name: Report
+        if: always()
+        run: |
+          { echo '```'; cat eval-report.txt 2>/dev/null || echo 'no report was produced'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report
+          path: eval-report.txt
+          if-no-files-found: ignore
 
   node:
     name: Launcher + manifests
