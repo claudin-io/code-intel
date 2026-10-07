@@ -6,6 +6,12 @@ on:
   pull_request:
   # Run the whole thing, platform matrix included, on any branch by hand.
   workflow_dispatch:
+    inputs:
+      eval_model:
+        description: "Search eval: auto (the default models) or both (EmbeddingGemma 2 for text as well; over an hour)"
+        type: choice
+        options: [auto, both]
+        default: auto
 
 env:
   CARGO_TERM_COLOR: always
@@ -164,16 +170,23 @@ jobs:
           { echo '```'; cat e2e-report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice title=EmbeddingGemma 2 on real weights::$(sed 's/%/%25/g' e2e-report.txt | awk '{printf "%s%%0A", $0}')"
 
-  # Search quality on real queries, per model: the rank of the expected file
-  # for each query, the raw cosine distributions, a sweep over the fusion
-  # gates and the indexing speed. The workspace is Claudinio Code at a pinned
-  # commit — the repository the query set was written against. The report is
-  # the job summary; `GEMMA2_MIN_COSINE_CANDIDATE` and `MEDIA_MIN_COSINE` in
-  # db.rs are set from it.
+  # Search quality on real queries: the rank of the expected file for each
+  # query, the raw cosine distributions, a sweep over the fusion gates, how
+  # the workspace's images score, and the indexing speed. The workspace is
+  # Claudinio Code at a pinned commit — the repository the query set was
+  # written against. The report is the job summary; the gates in db.rs are
+  # set from it.
+  #
+  # A pull request is measured with the models the server uses by default
+  # (MiniLM for text, EmbeddingGemma 2 for media). Embedding the whole
+  # workspace with EmbeddingGemma 2 as well takes over an hour; that
+  # comparison is run by hand (`eval_model: both`), which is also how
+  # `GEMMA2_MIN_COSINE_CANDIDATE` gets its value.
   eval:
-    name: Search quality (MiniLM vs EmbeddingGemma 2)
+    name: Search quality
     if: github.event_name != 'push'
     runs-on: ubuntu-24.04
+    timeout-minutes: 300
     env:
       EVAL_REPO: https://github.com/claudin-io/claudinio-code
       EVAL_COMMIT: 9374045be14ba1544093cdac079dbb2c2cc2e088
@@ -196,7 +209,8 @@ jobs:
       - name: Eval
         run: |
           cargo run --release -p claudinio-code-intel --example semantic_eval -- \
-            "$RUNNER_TEMP/workspace" --models-dir .e2e-models --sweep --report eval-report.txt
+            "$RUNNER_TEMP/workspace" --models-dir .e2e-models --sweep --report eval-report.txt \
+            --model "${{ inputs.eval_model || 'auto' }}"
       - name: Report
         if: always()
         run: |
