@@ -2,7 +2,7 @@
 //! including the ones that will never have a vision or audio encoder.
 
 use claudinio_code_intel::db::IndexDb;
-use claudinio_code_intel::embeddings::MINILM_DIM;
+use claudinio_code_intel::embeddings::{MINILM_DIM, ModelProfile};
 use claudinio_code_intel::indexer;
 use claudinio_code_intel::media::{MediaKind, MediaNeeds};
 use std::path::Path;
@@ -173,11 +173,11 @@ fn a_same_size_edit_is_noticed() {
 /// An index holding one embedded file. `written_by` is the model that built
 /// it, recorded the way the embedding pass records it — before the first
 /// vector lands; `None` is an index from before models were recorded.
-fn db_with_vector(dim: usize, written_by: Option<&str>) -> (tempfile::TempDir, IndexDb) {
+fn db_with_vector(dim: usize, written_by: Option<&'static str>) -> (tempfile::TempDir, IndexDb) {
     let dbdir = tempfile::tempdir().unwrap();
     let db = IndexDb::open(&dbdir.path().join("index.db")).unwrap();
     if let Some(model) = written_by {
-        db.reconcile_embedding_model(model, dim, MediaNeeds::NONE)
+        db.reconcile_embedding_model(&ModelProfile::text_only(model, dim))
             .unwrap();
     }
     let fid = db.upsert_file("/ws/a.rs", "rust", "h1", 0, 10).unwrap();
@@ -218,7 +218,7 @@ fn a_model_change_re_embeds_instead_of_mixing_vectors() {
         "an unrecorded index is MiniLM's"
     );
     let reset = db
-        .reconcile_embedding_model(MINILM, MINILM_DIM, MediaNeeds::NONE)
+        .reconcile_embedding_model(&ModelProfile::text_only(MINILM, MINILM_DIM))
         .unwrap();
     assert!(!reset.model_changed);
     assert_eq!(db.index_stats().unwrap().2, 1);
@@ -226,7 +226,7 @@ fn a_model_change_re_embeds_instead_of_mixing_vectors() {
 
     // The upgrade: a pre-existing MiniLM index opened by EmbeddingGemma 2.
     let reset = db
-        .reconcile_embedding_model(G2, 768, MediaNeeds::NONE)
+        .reconcile_embedding_model(&ModelProfile::text_only(G2, 768))
         .unwrap();
     assert!(reset.model_changed);
     assert_eq!(db.index_stats().unwrap().2, 0, "old vectors are gone");
@@ -238,7 +238,7 @@ fn a_model_change_re_embeds_instead_of_mixing_vectors() {
     assert_eq!(db.embedding_model().as_deref(), Some(G2));
     // Once is enough.
     assert!(
-        !db.reconcile_embedding_model(G2, 768, MediaNeeds::NONE)
+        !db.reconcile_embedding_model(&ModelProfile::text_only(G2, 768))
             .unwrap()
             .model_changed
     );
@@ -246,13 +246,13 @@ fn a_model_change_re_embeds_instead_of_mixing_vectors() {
     // The fallback, the other way round.
     let (_d, db) = db_with_vector(768, Some(G2));
     assert!(
-        !db.reconcile_embedding_model(G2, 768, MediaNeeds::NONE)
+        !db.reconcile_embedding_model(&ModelProfile::text_only(G2, 768))
             .unwrap()
             .model_changed
     );
     assert_eq!(db.index_stats().unwrap().2, 1);
     assert!(
-        db.reconcile_embedding_model(MINILM, MINILM_DIM, MediaNeeds::NONE)
+        db.reconcile_embedding_model(&ModelProfile::text_only(MINILM, MINILM_DIM))
             .unwrap()
             .model_changed
     );
@@ -269,7 +269,7 @@ fn a_model_change_re_embeds_instead_of_mixing_vectors() {
         .unwrap();
     db.set_embed_hash(fid, "h2").unwrap();
     let reset = db
-        .reconcile_embedding_model(G2, 768, MediaNeeds::NONE)
+        .reconcile_embedding_model(&ModelProfile::text_only(G2, 768))
         .unwrap();
     assert!(
         reset.model_changed,
@@ -277,6 +277,103 @@ fn a_model_change_re_embeds_instead_of_mixing_vectors() {
     );
     assert_eq!(db.index_stats().unwrap().2, 0);
     assert_eq!(db.embedding_pending_files().unwrap(), 2);
+}
+
+/// One picture with a content vector, added to an index.
+fn add_image_vector(db: &IndexDb, dim: usize) {
+    let fid = db
+        .upsert_file("/ws/assets/logo.png", "image", "media:1:1", 0, 10)
+        .unwrap();
+    let sid = db
+        .insert_symbol(fid, "logo.png", "image", None, 0, 0, 0, 0, None)
+        .unwrap();
+    db.upsert_embedding(sid, 0, 0, 0, &vec![0.03f32; dim])
+        .unwrap();
+    db.set_embed_hash(fid, "media:1:1").unwrap();
+}
+
+/// Text and media vectors may come from two models — MiniLM for text with
+/// EmbeddingGemma 2 beside it for media is the default — and each is tracked
+/// on its own: changing one model re-embeds that kind of file and leaves the
+/// other kind's vectors, which took the longest to compute, where they are.
+#[test]
+fn text_and_media_models_change_independently() {
+    const G2: &str = "embeddinggemma-2-q4-768";
+    const MINILM: &str = "all-MiniLM-L6-v2";
+    let images = MediaNeeds {
+        images: true,
+        audio: false,
+    };
+    let two_models = ModelProfile {
+        text_model: MINILM,
+        text_dim: MINILM_DIM,
+        media_model: Some((G2, 768)),
+        media: images,
+    };
+    let code_vectors = |db: &IndexDb| db.index_stats().unwrap().2 - db.media_embedding_count().unwrap();
+
+    // 384-d text vectors and 768-d media vectors side by side are not a
+    // conflict: nothing is dropped, nothing queued.
+    let (_d, db) = db_with_vector(MINILM_DIM, None);
+    db.reconcile_embedding_model(&two_models).unwrap();
+    add_image_vector(&db, 768);
+    let reset = db.reconcile_embedding_model(&two_models).unwrap();
+    assert!(!reset.model_changed && !reset.media_model_changed);
+    let reset = db.reconcile_embedding_model(&two_models).unwrap();
+    assert_eq!(reset.media_requeued, 0, "and the media count has settled");
+    assert_eq!((code_vectors(&db), db.media_embedding_count().unwrap()), (1, 1));
+    assert_eq!(db.embedding_pending_files().unwrap(), 0);
+    assert_eq!(db.embedding_model().as_deref(), Some(MINILM));
+    assert_eq!(db.media_embedding_model().as_deref(), Some(G2));
+
+    // Text moves to EmbeddingGemma 2: the code is re-embedded, the picture
+    // is not — its vector already is that model's.
+    let reset = db
+        .reconcile_embedding_model(&ModelProfile::single(G2, 768, images))
+        .unwrap();
+    assert!(reset.model_changed && !reset.media_model_changed);
+    assert_eq!((code_vectors(&db), db.media_embedding_count().unwrap()), (0, 1));
+    assert_eq!(db.embedding_pending_files().unwrap(), 1);
+
+    // An embedder with nothing for media (MiniLM by name, a build without
+    // ONNX Runtime, a failed download) does not throw media vectors away.
+    let (_d, db) = db_with_vector(MINILM_DIM, None);
+    db.reconcile_embedding_model(&two_models).unwrap();
+    add_image_vector(&db, 768);
+    let reset = db
+        .reconcile_embedding_model(&ModelProfile::text_only(MINILM, MINILM_DIM))
+        .unwrap();
+    assert!(!reset.model_changed && !reset.media_model_changed);
+    assert_eq!((code_vectors(&db), db.media_embedding_count().unwrap()), (1, 1));
+
+    // Another media model: the picture is queued again, the code is not.
+    let other = ModelProfile {
+        media_model: Some(("some-later-media-model", 512)),
+        ..two_models
+    };
+    let reset = db.reconcile_embedding_model(&other).unwrap();
+    assert!(!reset.model_changed && reset.media_model_changed);
+    assert_eq!((code_vectors(&db), db.media_embedding_count().unwrap()), (1, 0));
+    assert_eq!(db.embedding_pending_files().unwrap(), 1);
+
+    // An index written when one model did everything records one id. Opened
+    // with text back on MiniLM, its media vectors are still good.
+    let (_d, db) = db_with_vector(768, Some(G2));
+    add_image_vector(&db, 768);
+    assert_eq!(db.media_embedding_model(), None);
+    let reset = db.reconcile_embedding_model(&two_models).unwrap();
+    assert!(reset.model_changed && !reset.media_model_changed);
+    assert_eq!((code_vectors(&db), db.media_embedding_count().unwrap()), (0, 1));
+    assert_eq!(db.media_embedding_model().as_deref(), Some(G2));
+
+    // And a media vector of the wrong size is another model's, whatever the
+    // record says.
+    let (_d, db) = db_with_vector(MINILM_DIM, None);
+    db.reconcile_embedding_model(&two_models).unwrap();
+    add_image_vector(&db, 512);
+    let reset = db.reconcile_embedding_model(&two_models).unwrap();
+    assert!(!reset.model_changed && reset.media_model_changed);
+    assert_eq!((code_vectors(&db), db.media_embedding_count().unwrap()), (1, 0));
 }
 
 /// `Path` keeps this file honest about what it claims to test: no feature

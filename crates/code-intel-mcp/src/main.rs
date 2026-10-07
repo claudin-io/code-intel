@@ -164,17 +164,23 @@ fn embedding_model(ws: &Workspace) -> Option<String> {
 }
 
 /// Images and audio in the index, how many have a content vector (the rest
-/// match by file name only), and which encoders are loaded.
+/// match by file name only), the model those vectors come from — it need not
+/// be the text one — and which of its encoders are loaded.
 fn media_status(ws: &Workspace) -> serde_json::Value {
     let (images, audio) = ws.db.media_file_counts().unwrap_or((0, 0));
-    let support = ws
+    let (support, model) = ws
         .current_embedder()
-        .and_then(|e| e.lock().ok().map(|g| g.media_support()))
+        .and_then(|e| {
+            e.lock()
+                .ok()
+                .map(|g| (g.media_support(), g.media_model().map(|(id, _)| id.to_string())))
+        })
         .unwrap_or_default();
     serde_json::json!({
         "images": images,
         "audio": audio,
         "withContentVector": ws.db.media_embedding_count().unwrap_or(0),
+        "model": model.or_else(|| ws.db.media_embedding_model()),
         "imageEncoder": support.images,
         "audioEncoder": support.audio,
     })
@@ -331,7 +337,7 @@ impl CodeIntel {
 impl CodeIntel {
     #[tool(
         name = "index_status",
-        description = "State of the local code index: phase (indexing | embedding | lexical_only | ready | failed), scan/embedding progress, counts of indexed files, symbols and embeddings, the embedding model in use, and how many image/audio files are indexed. Call this when a search tool says the index is not ready."
+        description = "State of the local code index: phase (indexing | embedding | lexical_only | ready | failed), scan/embedding progress, counts of indexed files, symbols and embeddings, the embedding model in use, and how many image/audio files are indexed (with the model and encoders that describe their content, when loaded). Call this when a search tool says the index is not ready."
     )]
     async fn index_status(
         &self,
@@ -425,7 +431,7 @@ impl CodeIntel {
 
     #[tool(
         name = "semantic_search",
-        description = "Hybrid code & documentation search: BM25 keyword matching over code bodies, docs and file paths, fused with semantic embeddings. Finds code by exact identifiers, rare terms and file names AND by meaning/behavior — e.g. 'message queue system' finds a drain/push/queue implementation without an identifier match. Prefer this whenever you don't have a precise symbol name. Write the query in English: code and docs are, and the fallback embedding model is English-only. Response is {mode, note?, results, media?}: mode is 'hybrid' or 'lexical-only' (while the embedding model loads), each result has score (relative confidence in (0,1]) and matchType ('hybrid'|'semantic'|'lexical'); the top results include a source snippet. `media`, when present, lists image/audio files of the project that match the query — by what they show or sound like when the multimodal model is loaded (see index_status), by file name otherwise. Ranking: semantic_search → code_search (symbol names) → grep (fallback)."
+        description = "Hybrid code & documentation search: BM25 keyword matching over code bodies, docs and file paths, fused with semantic embeddings. Finds code by exact identifiers, rare terms and file names AND by meaning/behavior — e.g. 'message queue system' finds a drain/push/queue implementation without an identifier match. Prefer this whenever you don't have a precise symbol name. Write the query in English: code and docs are, and the default embedding model is English-only. Response is {mode, note?, results, media?}: mode is 'hybrid' or 'lexical-only' (while the embedding model loads), each result has score (relative confidence in (0,1]) and matchType ('hybrid'|'semantic'|'lexical'); the top results include a source snippet. `media`, when present, lists image/audio files of the project that match the query — by what they show or sound like when the multimodal model is loaded (see index_status), by file name otherwise. Ranking: semantic_search → code_search (symbol names) → grep (fallback)."
     )]
     async fn semantic_search(
         &self,
@@ -511,7 +517,7 @@ impl ServerHandler for CodeIntel {
                 Implementation::new("claudinio-code-intel", env!("CARGO_PKG_VERSION"))
                     .with_title("Claudinio Code Intel")
                     .with_description(
-                        "Local hybrid code search: tree-sitter symbols + BM25 + embeddings (EmbeddingGemma 2, or MiniLM as fallback). Nothing leaves the machine.",
+                        "Local hybrid code search: tree-sitter symbols + BM25 + embeddings (MiniLM for code and docs; EmbeddingGemma 2 for images and audio). Nothing leaves the machine.",
                     )
                     .with_website_url("https://github.com/claudin-io/code-intel"),
             )

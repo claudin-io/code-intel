@@ -262,4 +262,53 @@ fn real_model_ranks_code_images_and_audio() {
         let scores: Vec<f32> = audio_vecs.iter().map(|d| dot(&qv, d)).collect();
         say!("  {scores:.3?}  {q}");
     }
+    drop(shared);
+
+    // ── the default pairing ─────────────────────────────────────────────
+    // What the server loads when nothing is configured: MiniLM for text,
+    // the model above beside it for media. Same files, already downloaded;
+    // MiniLM (23 MB) is fetched here.
+    let started = Instant::now();
+    let paired = rt
+        .block_on(embeddings::ensure_and_load(&root, ModelChoice::Auto, needs))
+        .expect("the default pairing loads");
+    say!("\ndefault pairing: loaded in {:.1}s", started.elapsed().as_secs_f32());
+    {
+        let guard = paired.lock().unwrap();
+        assert_eq!(guard.model_id(), embeddings::MINILM_MODEL_ID);
+        assert_eq!(guard.media_model(), Some((gemma2::MODEL_ID, gemma2::EMBED_DIM)));
+        assert_eq!(guard.media_support(), needs);
+    }
+    let t = Instant::now();
+    let doc_vecs = paired.lock().unwrap().encode(&docs).expect("encode documents");
+    say!("{} code chunks on MiniLM: {:.2}s", docs.len(), t.elapsed().as_secs_f32());
+    assert_eq!(doc_vecs[0].len(), embeddings::MINILM_DIM);
+    say!("code on MiniLM  (rows: queries, columns: documents)");
+    for q in &queries {
+        let qv = paired.lock().unwrap().encode_query(q).expect("encode query");
+        let scores: Vec<f32> = doc_vecs.iter().map(|d| dot(&qv, d)).collect();
+        // Printed, not asserted: MiniLM's ranking is not what this branch
+        // changes, and its eval is `examples/semantic_eval.rs`.
+        say!("  {scores:.3?}  {q}");
+    }
+    // Media goes through the same engine as above, so the same picture must
+    // get the same vector — and the same query the same ranking.
+    let red = dir.path().join(images[0].0);
+    let again = embeddings::embed_media_file(&paired, &red, MediaKind::Image).expect("embed image");
+    assert!(
+        dot(&again, &image_vecs[0]) > 0.999,
+        "one model, one vector per picture, whichever role it is loaded in"
+    );
+    let qv = paired
+        .lock()
+        .unwrap()
+        .encode_media_query(images[0].3)
+        .unwrap()
+        .expect("the media engine answers media queries");
+    let scores: Vec<f32> = image_vecs.iter().map(|d| dot(&qv, d)).collect();
+    assert_eq!(
+        scores[0],
+        scores.iter().cloned().fold(f32::MIN, f32::max),
+        "{scores:?}"
+    );
 }

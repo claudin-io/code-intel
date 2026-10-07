@@ -86,8 +86,9 @@ pub fn models_root(cache_dir: &Path) -> PathBuf {
 }
 
 /// The embedder is loaded once per process and shared by every workspace:
-/// EmbeddingGemma 2 is a few hundred megabytes resident, and two open roots
-/// must not mean two copies. Keyed by the models directory so a second cache
+/// EmbeddingGemma 2 — there for the first workspace that has images or audio
+/// — is a few hundred megabytes resident, and two open roots must not mean
+/// two copies. Keyed by the models directory so a second cache
 /// (tests) gets its own.
 static EMBEDDER: tokio::sync::Mutex<Option<(PathBuf, SharedEmbedder)>> = tokio::sync::Mutex::const_new(None);
 
@@ -245,6 +246,7 @@ impl Workspace {
             let media = emb.media_support();
             tracing::info!(
                 model = emb.model_id(),
+                media_model = emb.media_model().map(|(id, _)| id).unwrap_or("none"),
                 images = media.images,
                 audio = media.audio,
                 "embedding model ready"

@@ -14,8 +14,13 @@
 //! returns the pooled, normalized `sentence_embedding`. Nothing here is
 //! assumed silently: `load` checks the inputs and outputs it relies on and
 //! runs one real encode, so a graph this code does not understand fails at
-//! load time, where the caller falls back to MiniLM, rather than at search
+//! load time, where the caller carries on without it, rather than at search
 //! time.
+//!
+//! By default this model is loaded for media only, beside MiniLM
+//! (`embeddings::CodeEmbedder`): the text half below then embeds the soft
+//! tokens of a picture or a clip and the queries compared against them, and
+//! `encode_documents` goes unused.
 
 use crate::media::{MediaKind, MediaNeeds};
 use crate::media_prep::{self, AudioFeatures, ImagePatches};

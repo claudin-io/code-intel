@@ -6,10 +6,11 @@
 //! BM25 and vector ranks with reciprocal rank fusion. Code is never sent
 //! anywhere to be indexed.
 //!
-//! The embedding model is EmbeddingGemma 2 in the ONNX Runtime build
-//! (`gemma2`: text, plus images and audio when the workspace has any) and
-//! all-MiniLM-L6-v2 everywhere else — and wherever the larger model cannot be
-//! downloaded or loaded. `media` lists a workspace's images and audio;
+//! Text is embedded with all-MiniLM-L6-v2 in every build. In the ONNX Runtime
+//! build, a workspace with images or audio also gets EmbeddingGemma 2
+//! (`gemma2`), which places those in one space with the queries that
+//! describe them; it can be made the text model as well
+//! (`embeddings::ModelChoice`). `media` lists a workspace's images and audio;
 //! `media_prep` decodes them for the encoders.
 //!
 //! Extracted from `claudin-io/claudinio-code` `src-tauri/src/code_intel/`; the

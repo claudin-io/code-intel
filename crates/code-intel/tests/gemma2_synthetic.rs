@@ -13,7 +13,7 @@
 
 use claudinio_code_intel::db::IndexDb;
 use claudinio_code_intel::embeddings::{
-    self, CodeEmbedder, MINILM_MODEL_ID, ModelChoice, SharedEmbedder,
+    self, CodeEmbedder, MINILM_MODEL_ID, ModelChoice, ModelProfile, SharedEmbedder,
 };
 use claudinio_code_intel::gemma2::{self, Gemma2Embedder, QueryTask};
 use claudinio_code_intel::indexer;
@@ -400,14 +400,19 @@ fn a_workspace_with_media_is_indexed_and_searchable() {
     let (_, again) = indexer::generate_all_embeddings(&db, &shared, None, &root).unwrap();
     assert_eq!(again, 0);
 
-    // The model changes under the index (here: the fallback to MiniLM).
-    // Vectors of the old model are gone and every file is queued again.
+    // The text model changes under the index (here: back to MiniLM). The
+    // code vectors are gone and the code queued again; the media vectors,
+    // which are not MiniLM's business, stay.
     let reset = db
-        .reconcile_embedding_model(MINILM_MODEL_ID, embeddings::MINILM_DIM, MediaNeeds::NONE)
+        .reconcile_embedding_model(&ModelProfile::text_only(
+            MINILM_MODEL_ID,
+            embeddings::MINILM_DIM,
+        ))
         .unwrap();
-    assert!(reset.model_changed);
-    assert_eq!(db.index_stats().unwrap().2, 0);
-    assert!(db.embedding_pending_files().unwrap() >= 3);
+    assert!(reset.model_changed && !reset.media_model_changed);
+    assert_eq!(db.index_stats().unwrap().2, 2, "the two media vectors");
+    assert_eq!(db.media_embedding_count().unwrap(), 2);
+    assert!(db.embedding_pending_files().unwrap() >= 1);
     assert_eq!(db.embedding_model().as_deref(), Some(MINILM_MODEL_ID));
 }
 
@@ -498,36 +503,81 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// A models root (`<cache>/models`) with the stand-in model where the real
-/// one would be downloaded to.
-fn models_root(files: &[&str]) -> tempfile::TempDir {
+fn minilm_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minilm-synthetic")
+}
+
+/// A models root (`<cache>/models`) with the stand-in MiniLM in place and the
+/// named stand-in EmbeddingGemma 2 files where the real ones would be
+/// downloaded to. Nothing in these tests may reach for a file that is not
+/// here: that would be a download of the real model.
+fn models_root(gemma2_files: &[&str]) -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
-    let dir = root.path().join(gemma2::CACHE_DIRNAME);
-    std::fs::create_dir_all(&dir).unwrap();
-    for name in files {
-        std::fs::copy(fixture_dir().join(name), dir.join(name)).unwrap();
+    let minilm = embeddings::minilm_dir(root.path());
+    std::fs::create_dir_all(&minilm).unwrap();
+    for name in ["model_quantized.onnx", "tokenizer.json"] {
+        std::fs::copy(minilm_fixture_dir().join(name), minilm.join(name)).unwrap();
+    }
+    if !gemma2_files.is_empty() {
+        let dir = root.path().join(gemma2::CACHE_DIRNAME);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in gemma2_files {
+            std::fs::copy(fixture_dir().join(name), dir.join(name)).unwrap();
+        }
     }
     root
 }
 
-/// What the server calls at start-up. With the files already in the cache
-/// nothing is downloaded; the encoders loaded are exactly the ones the
-/// workspace's media asks for.
+const IMAGES: MediaNeeds = MediaNeeds {
+    images: true,
+    audio: false,
+};
+const AUDIO_ONLY: MediaNeeds = MediaNeeds {
+    images: false,
+    audio: true,
+};
+const BOTH: MediaNeeds = MediaNeeds {
+    images: true,
+    audio: true,
+};
+
+/// What the server calls at start-up, under the default choice. Text is
+/// MiniLM whatever the workspace holds. EmbeddingGemma 2 is not so much as
+/// looked for until a workspace has media, and then it comes with exactly the
+/// encoders that media asks for.
 #[test]
-fn ensure_and_load_picks_gemma2_and_only_the_encoders_needed() {
-    let root = models_root(&all_files());
+fn by_default_text_is_minilm_and_gemma2_joins_only_for_media() {
     let rt = runtime();
-    for needs in [
-        MediaNeeds::NONE,
-        MediaNeeds {
-            images: true,
-            audio: false,
-        },
-        MediaNeeds {
-            images: false,
-            audio: true,
-        },
-    ] {
+
+    // A text-only project, with no EmbeddingGemma 2 anywhere: nothing is
+    // missed and nothing is fetched.
+    let bare = models_root(&[]);
+    let shared = rt
+        .block_on(embeddings::ensure_and_load(
+            bare.path(),
+            ModelChoice::Auto,
+            MediaNeeds::NONE,
+        ))
+        .unwrap();
+    {
+        let mut guard = shared.lock().unwrap();
+        assert_eq!(guard.model_id(), MINILM_MODEL_ID);
+        assert_eq!(guard.embedding_dim(), embeddings::MINILM_DIM);
+        assert_eq!(guard.media_model(), None);
+        assert_eq!(guard.media_support(), MediaNeeds::NONE);
+        assert_eq!(guard.encode_media_query("a red picture").unwrap(), None);
+        assert_eq!(
+            guard.profile(),
+            ModelProfile::text_only(MINILM_MODEL_ID, embeddings::MINILM_DIM)
+        );
+    }
+    assert!(
+        !bare.path().join(gemma2::CACHE_DIRNAME).exists(),
+        "a text-only workspace must not start a download"
+    );
+
+    let root = models_root(&all_files());
+    for needs in [IMAGES, AUDIO_ONLY] {
         let shared = rt
             .block_on(embeddings::ensure_and_load(
                 root.path(),
@@ -535,84 +585,253 @@ fn ensure_and_load_picks_gemma2_and_only_the_encoders_needed() {
                 needs,
             ))
             .unwrap();
-        let guard = shared.lock().unwrap();
-        assert_eq!(guard.model_id(), gemma2::MODEL_ID);
+        let mut guard = shared.lock().unwrap();
+        assert_eq!(guard.model_id(), MINILM_MODEL_ID, "text stays on MiniLM");
+        assert_eq!(guard.embedding_dim(), embeddings::MINILM_DIM);
+        assert_eq!(
+            guard.media_model(),
+            Some((gemma2::MODEL_ID, gemma2::EMBED_DIM))
+        );
         assert_eq!(guard.media_support(), needs);
+        // Two models, two spaces: a query is embedded once for each.
+        assert_eq!(
+            guard.encode_query("retry upload").unwrap().len(),
+            embeddings::MINILM_DIM
+        );
+        assert_eq!(
+            guard
+                .encode_media_query("a red picture")
+                .unwrap()
+                .expect("the media engine answers media queries")
+                .len(),
+            gemma2::EMBED_DIM
+        );
     }
 
-    // A second workspace with audio joins a process that started without it.
+    // A process that started on a text-only workspace, joined by one with
+    // images and then one with audio.
     let shared = rt
         .block_on(embeddings::ensure_and_load(
             root.path(),
             ModelChoice::Auto,
-            MediaNeeds {
-                images: true,
-                audio: false,
-            },
+            MediaNeeds::NONE,
         ))
         .unwrap();
-    rt.block_on(embeddings::extend_media(
-        &shared,
-        MediaNeeds {
-            images: false,
-            audio: true,
-        },
-    ));
-    assert_eq!(
-        shared.lock().unwrap().media_support(),
-        MediaNeeds {
-            images: true,
-            audio: true
-        }
-    );
+    assert_eq!(shared.lock().unwrap().media_model(), None);
+    rt.block_on(embeddings::extend_media(&shared, IMAGES));
+    assert_eq!(shared.lock().unwrap().media_support(), IMAGES);
+    rt.block_on(embeddings::extend_media(&shared, AUDIO_ONLY));
+    assert_eq!(shared.lock().unwrap().media_support(), BOTH);
+    assert_eq!(shared.lock().unwrap().model_id(), MINILM_MODEL_ID);
 }
 
-/// A text model this runtime cannot load must not end semantic search: under
-/// the default choice the loader moves on to MiniLM, and only an explicit
-/// request for EmbeddingGemma 2 stops there. Nothing is downloaded here —
-/// every file "exists", they are just not models — so what MiniLM's turn
-/// leaves behind is its self-heal: the unusable directory removed.
+/// The two explicit choices. MiniLM by name is MiniLM and nothing else, media
+/// or not; EmbeddingGemma 2 by name is that model for text as well.
 #[test]
-fn an_unloadable_gemma2_falls_back_to_minilm_unless_forced() {
-    let root = tempfile::tempdir().unwrap();
-    let gemma_dir = root.path().join(gemma2::CACHE_DIRNAME);
-    std::fs::create_dir_all(&gemma_dir).unwrap();
-    for (_, local, _, _) in gemma2::component_files(None) {
-        std::fs::write(gemma_dir.join(local), b"not a model").unwrap();
-    }
-    let minilm_dir = embeddings::minilm_dir(root.path());
-    let plant_minilm = || {
-        std::fs::create_dir_all(&minilm_dir).unwrap();
-        for (_, local, _, _) in embeddings::required_model_files() {
-            std::fs::write(minilm_dir.join(local), b"not a model").unwrap();
-        }
-    };
+fn an_explicit_model_choice_is_taken_literally() {
+    let root = models_root(&all_files());
     let rt = runtime();
 
-    plant_minilm();
+    let minilm = rt
+        .block_on(embeddings::ensure_and_load(
+            root.path(),
+            ModelChoice::MiniLm,
+            BOTH,
+        ))
+        .unwrap();
+    rt.block_on(embeddings::extend_media(&minilm, BOTH));
+    {
+        let guard = minilm.lock().unwrap();
+        assert_eq!(guard.model_id(), MINILM_MODEL_ID);
+        assert_eq!(guard.media_model(), None);
+        assert_eq!(guard.media_support(), MediaNeeds::NONE);
+    }
+
+    for needs in [MediaNeeds::NONE, IMAGES, AUDIO_ONLY] {
+        let shared = rt
+            .block_on(embeddings::ensure_and_load(
+                root.path(),
+                ModelChoice::Gemma2,
+                needs,
+            ))
+            .unwrap();
+        let guard = shared.lock().unwrap();
+        assert_eq!(guard.model_id(), gemma2::MODEL_ID);
+        assert_eq!(guard.embedding_dim(), gemma2::EMBED_DIM);
+        assert_eq!(guard.media_support(), needs);
+        assert_eq!(
+            guard.profile(),
+            ModelProfile::single(gemma2::MODEL_ID, gemma2::EMBED_DIM, needs)
+        );
+    }
+}
+
+/// An EmbeddingGemma 2 this runtime cannot load costs content search over
+/// media and nothing else: under the default choice text search comes up on
+/// MiniLM regardless, and only an explicit request for EmbeddingGemma 2
+/// fails. Nothing is downloaded here — every file "exists", they are just
+/// not models.
+#[test]
+fn an_unloadable_gemma2_costs_media_search_only_unless_forced() {
+    let root = models_root(&[]);
+    let gemma_dir = root.path().join(gemma2::CACHE_DIRNAME);
+    std::fs::create_dir_all(&gemma_dir).unwrap();
+    for kind in [None, Some(MediaKind::Image), Some(MediaKind::Audio)] {
+        for (_, local, _, _) in gemma2::component_files(kind) {
+            std::fs::write(gemma_dir.join(local), b"not a model").unwrap();
+        }
+    }
+    let rt = runtime();
+
     let forced = rt.block_on(embeddings::ensure_and_load(
         root.path(),
         ModelChoice::Gemma2,
-        MediaNeeds::NONE,
+        BOTH,
     ));
-    assert!(forced.is_err());
     assert!(
-        minilm_dir.exists(),
-        "an explicit EmbeddingGemma 2 request never touches MiniLM"
+        forced.is_err(),
+        "an explicit choice is never swapped for MiniLM"
     );
 
-    let auto = rt.block_on(embeddings::ensure_and_load(
-        root.path(),
-        ModelChoice::Auto,
-        MediaNeeds::NONE,
-    ));
-    assert!(auto.is_err(), "neither planted model is real");
+    let shared = rt
+        .block_on(embeddings::ensure_and_load(
+            root.path(),
+            ModelChoice::Auto,
+            BOTH,
+        ))
+        .expect("text search does not depend on EmbeddingGemma 2");
+    {
+        let mut guard = shared.lock().unwrap();
+        assert_eq!(guard.model_id(), MINILM_MODEL_ID);
+        assert_eq!(guard.media_model(), None);
+        assert_eq!(guard.media_support(), MediaNeeds::NONE);
+        assert_eq!(
+            guard.encode_query("retry upload").unwrap().len(),
+            embeddings::MINILM_DIM
+        );
+    }
+    // The failure is remembered: opening another workspace with media must
+    // not load the same unusable files again (it would, here, find them
+    // replaced by a working model).
+    for name in all_files() {
+        std::fs::copy(fixture_dir().join(name), gemma_dir.join(name)).unwrap();
+    }
+    rt.block_on(embeddings::extend_media(&shared, BOTH));
+    assert_eq!(shared.lock().unwrap().media_model(), None);
     assert!(
-        !minilm_dir.exists(),
-        "MiniLM was tried after EmbeddingGemma 2 failed"
-    );
-    assert!(
-        gemma_dir.exists(),
+        gemma_dir.join("model_q4.onnx").exists(),
         "hash-checked EmbeddingGemma 2 files are not deleted on a load error"
     );
+
+    // A workspace whose media cannot get content vectors is still indexed:
+    // code by MiniLM, media by name.
+    let ws = workspace();
+    let ws_root = ws.path().to_string_lossy().to_string();
+    let db = IndexDb::open(&ws.path().join("index.db")).unwrap();
+    indexer::scan_workspace(&db, &ws_root, None, None, None).unwrap();
+    let (_, vectors) = indexer::generate_all_embeddings(&db, &shared, None, &ws_root).unwrap();
+    assert!(vectors >= 1);
+    assert_eq!(db.media_embedding_count().unwrap(), 0);
+    assert_eq!(db.embedding_pending_files().unwrap(), 0);
+    assert_eq!(db.search_media("app logo", None, 3).unwrap().len(), 1);
+}
+
+/// The default pairing, end to end: one workspace, two models, one index.
+/// Code gets MiniLM vectors, media gets EmbeddingGemma 2 vectors, each kind
+/// of search compares like with like, and re-opening re-embeds nothing.
+#[test]
+fn the_default_pairing_indexes_code_and_media_side_by_side() {
+    let models = models_root(&all_files());
+    let rt = runtime();
+    let ws = workspace();
+    let root = ws.path().to_string_lossy().to_string();
+    let db = IndexDb::open(&ws.path().join("index.db")).unwrap();
+    indexer::scan_workspace(&db, &root, None, None, None).unwrap();
+
+    let shared = rt
+        .block_on(embeddings::ensure_and_load(
+            models.path(),
+            ModelChoice::Auto,
+            BOTH,
+        ))
+        .unwrap();
+    let (_, vectors) = indexer::generate_all_embeddings(&db, &shared, None, &root).unwrap();
+    assert!(vectors >= 3, "code plus two media files, got {vectors}");
+    assert_eq!(db.media_embedding_count().unwrap(), 2);
+    assert_eq!(db.embedding_pending_files().unwrap(), 0);
+    assert_eq!(db.embedding_model().as_deref(), Some(MINILM_MODEL_ID));
+    assert_eq!(
+        db.media_embedding_model().as_deref(),
+        Some(gemma2::MODEL_ID)
+    );
+
+    // Code search: a MiniLM query against MiniLM vectors. The 768-d media
+    // vectors in the same table are not candidates and not an error.
+    let q = shared
+        .lock()
+        .unwrap()
+        .encode_query("retry failed upload")
+        .unwrap();
+    assert_eq!(q.len(), embeddings::MINILM_DIM);
+    let code = db.search_hybrid("retry failed upload", Some(&q), 10).unwrap();
+    assert_eq!(code[0].name, "retry_failed_upload");
+    assert_eq!(
+        code[0].match_type, "hybrid",
+        "the vector leg took part: {code:?}"
+    );
+    assert!(code.iter().all(|r| r.kind != "image" && r.kind != "audio"));
+
+    // Media search: the logo's own vector is the best possible content
+    // match, and it is found by content.
+    let logo = ws.path().join("assets").join("app-logo.png");
+    let logo_vec = embeddings::embed_media_file(&shared, &logo, MediaKind::Image).unwrap();
+    assert_eq!(logo_vec.len(), gemma2::EMBED_DIM);
+    let hits = db.search_media("zzz", Some(&logo_vec), 3).unwrap();
+    assert!(hits[0].file_path.ends_with("app-logo.png"));
+    assert_eq!(hits[0].match_type, "semantic");
+    // A MiniLM vector handed to media search by mistake matches nothing by
+    // content rather than everything by accident.
+    let wrong = db.search_media("zzz", Some(&q), 3).unwrap();
+    assert!(wrong.is_empty(), "{wrong:?}");
+
+    // Re-opening — same process or the next one — is a no-op.
+    let (_, again) = indexer::generate_all_embeddings(&db, &shared, None, &root).unwrap();
+    assert_eq!(again, 0);
+    let reopened = rt
+        .block_on(embeddings::ensure_and_load(
+            models.path(),
+            ModelChoice::Auto,
+            BOTH,
+        ))
+        .unwrap();
+    let (_, again) = indexer::generate_all_embeddings(&db, &reopened, None, &root).unwrap();
+    assert_eq!(again, 0);
+
+    // Re-opened as a text-only session (no media engine loaded): nothing is
+    // re-embedded and the media vectors are still there for next time.
+    let text_only = rt
+        .block_on(embeddings::ensure_and_load(
+            models.path(),
+            ModelChoice::MiniLm,
+            BOTH,
+        ))
+        .unwrap();
+    let (_, again) = indexer::generate_all_embeddings(&db, &text_only, None, &root).unwrap();
+    assert_eq!(again, 0);
+    assert_eq!(db.media_embedding_count().unwrap(), 2);
+
+    // Switching text to EmbeddingGemma 2 re-embeds the code and only the
+    // code: the media vectors already are that model's.
+    let all_gemma = rt
+        .block_on(embeddings::ensure_and_load(
+            models.path(),
+            ModelChoice::Gemma2,
+            BOTH,
+        ))
+        .unwrap();
+    let before = db.index_stats().unwrap().2 - 2;
+    let (_, redone) = indexer::generate_all_embeddings(&db, &all_gemma, None, &root).unwrap();
+    assert_eq!(redone, before, "every code chunk, no media file");
+    assert_eq!(db.media_embedding_count().unwrap(), 2);
+    assert_eq!(db.embedding_model().as_deref(), Some(gemma2::MODEL_ID));
 }

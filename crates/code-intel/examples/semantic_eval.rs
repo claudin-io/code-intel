@@ -11,15 +11,20 @@
 //! this at.
 //!
 //!   cargo run --release --example semantic_eval -- <workspace_root> [queries.json]
-//!       [--model minilm|embeddinggemma2|both]   default: both (MiniLM only in a candle build)
+//!       [--model auto|minilm|embeddinggemma2|both]
+//!                                               default: both — `auto` (what the server runs: MiniLM
+//!                                               for text, EmbeddingGemma 2 beside it for media) and
+//!                                               then `embeddinggemma2` (that model for text as well);
+//!                                               `auto` alone in a candle build
 //!       [--models-dir <dir>]                    default: the plugin's own cache, so nothing is fetched twice
 //!       [--sweep]                               grid over the fusion gates, one row per combination
 //!       [--no-vector]                           BM25 leg only: the pending-embeddings window
 //!       [--report <file>]                       also write everything printed to <file>
 //!
-//! Models are downloaded on first use. Each model is requested explicitly, so
-//! a model that fails to load is reported as failed instead of being quietly
-//! replaced by the other one.
+//! Models are downloaded on first use. The text model of every run is named
+//! in its output, and `embeddinggemma2` has no fallback, so a model that
+//! fails to load is reported as failed instead of being quietly measured as
+//! the other one.
 
 use claudinio_code_intel::db::{HybridParams, IndexDb, MEDIA_MIN_COSINE};
 use claudinio_code_intel::embeddings::{self, ModelChoice, SharedEmbedder};
@@ -116,7 +121,7 @@ struct Options {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: semantic_eval <workspace_root> [queries.json] [--model minilm|embeddinggemma2|both] \
+        "usage: semantic_eval <workspace_root> [queries.json] [--model auto|minilm|embeddinggemma2|both] \
          [--models-dir <dir>] [--sweep] [--no-vector] [--report <file>]"
     );
     std::process::exit(1)
@@ -146,10 +151,10 @@ fn parse_args() -> Options {
         usage();
     }
     let models = match model.as_str() {
-        "both" if embeddings::gemma2_supported() => vec![ModelChoice::MiniLm, ModelChoice::Gemma2],
-        "both" => vec![ModelChoice::MiniLm],
+        "both" if embeddings::gemma2_supported() => vec![ModelChoice::Auto, ModelChoice::Gemma2],
+        "both" => vec![ModelChoice::Auto],
         other => match ModelChoice::parse(other) {
-            Some(ModelChoice::Auto) | None => usage(),
+            None => usage(),
             Some(choice) => vec![choice],
         },
     };
@@ -232,13 +237,14 @@ fn run_model(opts: &Options, eval: &EvalSet, choice: Option<ModelChoice>, report
                 needs,
             )) {
                 Ok(shared) => {
-                    let (id, support) = {
+                    let (id, media_model, support) = {
                         let g = shared.lock().unwrap();
-                        (g.model_id(), g.media_support())
+                        (g.model_id(), g.media_model(), g.media_support())
                     };
                     report.line(format!(
-                        "loaded {id} in {:.1}s (download included if it was not cached); encoders: image={} audio={}",
+                        "loaded in {:.1}s (download included if it was not cached); text: {id}; media: {}; encoders: image={} audio={}",
                         t.elapsed().as_secs_f32(),
+                        media_model.map(|(id, _)| id).unwrap_or("none"),
                         support.images,
                         support.audio
                     ));
@@ -288,8 +294,17 @@ fn run_model(opts: &Options, eval: &EvalSet, choice: Option<ModelChoice>, report
         let media_vectors = db.media_embedding_count().unwrap_or(0);
         let (images, audio) = db.media_file_counts().unwrap_or((0, 0));
         report.line(format!(
-            "embedded {vectors} vectors in {secs:.1}s ({:.1} vectors/s); media: {images} images, {audio} audio, {media_vectors} with a content vector",
-            vectors as f32 / secs.max(0.001)
+            "embedded {vectors} vectors in {secs:.1}s; media: {images} images, {audio} audio, {media_vectors} with a content vector"
+        ));
+        // The pass above mixes text chunks and media files. Time a few media
+        // files on their own to tell the two apart: what is left of the
+        // total is the text.
+        let media_secs = media_timing(shared, root, report);
+        let text_vectors = vectors - media_vectors;
+        let text_secs = (secs - media_secs * media_vectors as f32).max(0.001);
+        report.line(format!(
+            "text: {text_vectors} vectors in about {text_secs:.1}s ({:.1} vectors/s)",
+            text_vectors as f32 / text_secs
         ));
     }
 
@@ -333,6 +348,45 @@ fn run_model(opts: &Options, eval: &EvalSet, choice: Option<ModelChoice>, report
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
     }
+}
+
+/// Seconds to embed one media file, averaged over a few of the workspace's
+/// own (0 when there is nothing to time). Per kind in the report: an image
+/// and a sound cost differently.
+fn media_timing(shared: &SharedEmbedder, root: &str, report: &mut Report) -> f32 {
+    const SAMPLE: usize = 5;
+    let support = shared.lock().unwrap().media_support();
+    let files = media::media_files(root);
+    let (mut total, mut n) = (0f32, 0usize);
+    for kind in media::MediaKind::ALL {
+        if !support.has(kind) {
+            continue;
+        }
+        let mut times: Vec<f32> = Vec::new();
+        for (path, _) in files.iter().filter(|(_, k)| *k == kind) {
+            if times.len() == SAMPLE {
+                break;
+            }
+            let t = Instant::now();
+            if embeddings::embed_media_file(shared, Path::new(path), kind).is_ok() {
+                times.push(t.elapsed().as_secs_f32());
+            }
+        }
+        if times.is_empty() {
+            continue;
+        }
+        let sum: f32 = times.iter().sum();
+        report.line(format!(
+            "{}: {:.2}s per file (mean of {}; slowest {:.2}s)",
+            kind.as_str(),
+            sum / times.len() as f32,
+            times.len(),
+            times.iter().cloned().fold(0.0, f32::max)
+        ));
+        total += sum;
+        n += times.len();
+    }
+    if n == 0 { 0.0 } else { total / n as f32 }
 }
 
 fn print_summary(s: &Summary, hybrid: bool, report: &mut Report) {

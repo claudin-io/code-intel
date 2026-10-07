@@ -1,4 +1,5 @@
-use crate::media::{MEDIA_KINDS_SQL, MediaKind, MediaNeeds};
+use crate::embeddings::ModelProfile;
+use crate::media::{MEDIA_KINDS_SQL, MediaKind};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::path::Path;
@@ -89,8 +90,10 @@ pub struct MediaSearchResult {
 /// What `IndexDb::reconcile_embedding_model` had to discard.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EmbeddingReset {
-    /// The index held vectors of another model; all of them were dropped.
+    /// The index held text vectors of another model; they were dropped.
     pub model_changed: bool,
+    /// The index held media vectors of another model; they were dropped.
+    pub media_model_changed: bool,
     /// Media files queued again because an encoder for them is now loaded.
     pub media_requeued: i64,
 }
@@ -114,6 +117,7 @@ pub struct StoredChunk {
 const SCHEMA_VERSION: i64 = 7;
 
 const META_EMBED_MODEL: &str = "embed_model";
+const META_MEDIA_MODEL: &str = "media_model";
 const META_MEDIA_STATE: &str = "media_state";
 
 /// Tuning knobs for `search_hybrid_with`. `Default` holds the production
@@ -634,8 +638,9 @@ impl IndexDb {
         .map_err(|e| format!("set {key}: {e}"))
     }
 
-    /// The model the stored vectors came from, if any are stored. An index
-    /// written before models were recorded can only hold MiniLM vectors.
+    /// The model the stored text vectors came from, if any are stored. An
+    /// index written before models were recorded can only hold MiniLM
+    /// vectors.
     pub fn embedding_model(&self) -> Option<String> {
         let conn = self.conn.lock().ok()?;
         Self::embedding_model_locked(&conn)
@@ -651,58 +656,116 @@ impl IndexDb {
         (any != 0).then(|| crate::embeddings::MINILM_MODEL_ID.to_string())
     }
 
+    /// The model the stored media vectors came from, if recorded.
+    pub fn media_embedding_model(&self) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+        Self::meta_get(&conn, META_MEDIA_MODEL)
+    }
+
     /// Make the index consistent with the embedder about to write to it.
     ///
-    /// Vectors of two models cannot be compared, so if the index holds
-    /// another model's they are all dropped and every file queued for
-    /// embedding again — this is what happens the first time a workspace is
-    /// opened after the model changes, in either direction (including the
-    /// fallback to MiniLM). Stored vectors of any size other than `dim` count
-    /// as another model's too, whatever the recorded id says: an older
-    /// binary sharing this cache does not record what it writes.
+    /// Vectors of two models cannot be compared. Text and media vectors are
+    /// tracked separately, since they may come from different models
+    /// (`ModelProfile`): if the index holds text vectors of another model
+    /// they are dropped and every text file queued for embedding again —
+    /// this is what happens the first time a workspace is opened after the
+    /// text model changes, in either direction — and the same for media
+    /// vectors and the media model. Neither touches the other. Stored
+    /// vectors of the wrong length count as another model's too, whatever
+    /// the recorded id says: an older binary sharing this cache does not
+    /// record what it writes.
     ///
-    /// Media files are queued separately. One that got no vector — no
-    /// encoder for its kind was loaded, it was past the cap, it would not
-    /// decode — is marked done; whenever the loaded encoders, the cap or the
-    /// number of media vectors changes, those are queued again, without
-    /// touching any code vector. (The count is what gives a slot freed by a
-    /// deleted file to the next one, and it settles after one retry.)
+    /// An embedder with no media model at all leaves media vectors where
+    /// they are. Nothing can be compared against them meanwhile, and they
+    /// are still good when the model that wrote them is back.
+    ///
+    /// Media files are also queued for a second reason. One that got no
+    /// vector — no encoder for its kind was loaded, it was past the cap, it
+    /// would not decode — is marked done; whenever the loaded encoders, the
+    /// cap or the number of media vectors changes, those are queued again,
+    /// without touching any code vector. (The count is what gives a slot
+    /// freed by a deleted file to the next one, and it settles after one
+    /// retry.)
     ///
     /// One transaction: a process killed halfway must not leave an index
     /// whose vectors are gone but whose files still say "embedded".
-    pub fn reconcile_embedding_model(
-        &self,
-        model_id: &str,
-        dim: usize,
-        media: MediaNeeds,
-    ) -> Result<EmbeddingReset, String> {
+    pub fn reconcile_embedding_model(&self, profile: &ModelProfile) -> Result<EmbeddingReset, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| format!("begin reconcile: {e}"))?;
         let mut reset = EmbeddingReset::default();
 
-        let stored = Self::embedding_model_locked(&tx);
-        let foreign_vectors: i64 = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM symbol_embeddings WHERE length(embedding) != ?1)",
+        // Vectors of one role whose length is not `dim` floats.
+        let foreign = |media: bool, dim: usize| -> bool {
+            let not = if media { "" } else { "NOT" };
+            tx.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM symbol_embeddings e
+                                   JOIN symbols s ON s.id = e.symbol_id
+                                   WHERE s.kind {not} IN ({MEDIA_KINDS_SQL})
+                                     AND length(e.embedding) != ?1)"
+                ),
                 params![(dim * 4) as i64],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0),
             )
-            .unwrap_or(0);
-        if stored.as_deref().is_some_and(|s| s != model_id) || foreign_vectors != 0 {
-            eprintln!(
-                "[index] embedding model changed ({} -> {model_id}); re-embedding",
-                stored.as_deref().unwrap_or("unrecorded")
-            );
-            tx.execute("DELETE FROM symbol_embeddings", [])
+            .unwrap_or(0)
+                != 0
+        };
+        // Drop one role's vectors and queue its files; returns how many
+        // vectors went.
+        let drop_vectors = |media: bool| -> Result<usize, String> {
+            let not = if media { "" } else { "NOT" };
+            let dropped = tx
+                .execute(
+                    &format!(
+                        "DELETE FROM symbol_embeddings WHERE symbol_id IN
+                            (SELECT id FROM symbols WHERE kind {not} IN ({MEDIA_KINDS_SQL}))"
+                    ),
+                    [],
+                )
                 .map_err(|e| format!("drop embeddings: {e}"))?;
-            tx.execute("UPDATE files SET embed_hash = NULL", [])
+            let which = if media {
+                format!("language IN ({MEDIA_KINDS_SQL})")
+            } else {
+                format!("language IS NULL OR language NOT IN ({MEDIA_KINDS_SQL})")
+            };
+            tx.execute(&format!("UPDATE files SET embed_hash = NULL WHERE {which}"), [])
                 .map_err(|e| format!("requeue files: {e}"))?;
+            Ok(dropped)
+        };
+
+        let stored_text = Self::embedding_model_locked(&tx);
+        if stored_text.as_deref().is_some_and(|s| s != profile.text_model) || foreign(false, profile.text_dim) {
+            eprintln!(
+                "[index] embedding model changed ({} -> {}); re-embedding",
+                stored_text.as_deref().unwrap_or("unrecorded"),
+                profile.text_model
+            );
+            drop_vectors(false)?;
             reset.model_changed = true;
         }
-        Self::meta_set(&tx, META_EMBED_MODEL, model_id)?;
+        Self::meta_set(&tx, META_EMBED_MODEL, profile.text_model)?;
 
+        if let Some((media_model, media_dim)) = profile.media_model {
+            // Before the media model was recorded on its own, one model
+            // wrote both kinds of vector.
+            let stored_media = Self::meta_get(&tx, META_MEDIA_MODEL).or(stored_text);
+            if stored_media.as_deref().is_some_and(|s| s != media_model) || foreign(true, media_dim) {
+                // Usually there is nothing to drop — an index that never had
+                // a media model — so only a real loss is worth a line.
+                if drop_vectors(true)? > 0 {
+                    eprintln!(
+                        "[index] media embedding model changed ({} -> {media_model}); re-embedding media",
+                        stored_media.as_deref().unwrap_or("unrecorded")
+                    );
+                    reset.media_model_changed = true;
+                }
+            }
+            Self::meta_set(&tx, META_MEDIA_MODEL, media_model)?;
+        }
+
+        let media = profile.media;
         let mut kinds: Vec<&str> = MediaKind::ALL
             .into_iter()
             .filter(|k| media.has(*k))

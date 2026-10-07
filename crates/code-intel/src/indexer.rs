@@ -539,7 +539,7 @@ pub fn scan_workspace(
     // A scan given an embedder writes vectors as it goes, so the index must
     // agree with that embedder's model before the first one lands.
     if let Some(emb) = embedder.as_deref() {
-        db.reconcile_embedding_model(emb.model_id(), emb.embedding_dim(), emb.media_support())?;
+        db.reconcile_embedding_model(&emb.profile())?;
     }
 
     // Resolved once per scan; empty when the project has no locale resources,
@@ -806,13 +806,12 @@ pub fn generate_all_embeddings(
     // Before anything is read or written: vectors of another model are
     // dropped, and media files a newly loaded encoder can now describe are
     // queued again.
-    let (model_id, dim, media_support) = {
-        let emb = embedder
-            .lock()
-            .map_err(|e| format!("embedder lock poisoned: {e}"))?;
-        (emb.model_id(), emb.embedding_dim(), emb.media_support())
-    };
-    db.reconcile_embedding_model(model_id, dim, media_support)?;
+    let profile = embedder
+        .lock()
+        .map_err(|e| format!("embedder lock poisoned: {e}"))?
+        .profile();
+    db.reconcile_embedding_model(&profile)?;
+    let media_support = profile.media;
 
     let files = db.all_files()?;
     let total = files.len() as i64;
