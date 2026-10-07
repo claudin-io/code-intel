@@ -183,8 +183,9 @@ fn main() {
             .expect("parse queries.json");
     let mut report = Report::default();
     report.line(format!(
-        "semantic_eval — workspace {} — {} positive / {} negative / {} media queries",
+        "semantic_eval — workspace {} — {} threads per model run — {} positive / {} negative / {} media queries",
         opts.root,
+        embeddings::intra_threads(),
         eval.positive.len(),
         eval.negative.len(),
         eval.media.len()

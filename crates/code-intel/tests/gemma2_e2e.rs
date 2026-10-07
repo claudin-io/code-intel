@@ -21,6 +21,27 @@ use claudinio_code_intel::media::{MediaKind, MediaNeeds};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// Scores and timings go to stderr and, when `CODE_INTEL_E2E_REPORT` names a
+/// file, to that file as well — CI publishes it, since a job's log needs a
+/// sign-in to read and these numbers are what the search gates are set from.
+static REPORT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        let line = format!($($arg)*);
+        eprintln!("{line}");
+        let mut report = REPORT.lock().unwrap();
+        report.push_str(&line);
+        report.push('\n');
+    }};
+}
+
+fn write_report() {
+    if let Some(path) = std::env::var_os("CODE_INTEL_E2E_REPORT") {
+        std::fs::write(path, REPORT.lock().unwrap().as_bytes()).expect("write e2e report");
+    }
+}
+
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
@@ -77,6 +98,16 @@ fn wav(path: &Path, samples: &[i16]) {
 #[test]
 #[ignore = "downloads the real EmbeddingGemma 2 weights (~470 MB) from Hugging Face"]
 fn real_model_ranks_code_images_and_audio() {
+    // Written even when an assertion below fails: the numbers that explain
+    // a failure are the ones most worth having.
+    struct WriteOnDrop;
+    impl Drop for WriteOnDrop {
+        fn drop(&mut self) {
+            write_report();
+        }
+    }
+    let _report = WriteOnDrop;
+
     let root = models_root();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -95,7 +126,7 @@ fn real_model_ranks_code_images_and_audio() {
             needs,
         ))
         .expect("EmbeddingGemma 2 downloads and loads");
-    eprintln!(
+    say!(
         "download + load: {:.1}s into {}",
         started.elapsed().as_secs_f32(),
         root.display()
@@ -125,13 +156,13 @@ fn real_model_ranks_code_images_and_audio() {
         .unwrap()
         .encode(&docs)
         .expect("encode documents");
-    eprintln!(
+    say!(
         "{} code chunks: {:.2}s",
         docs.len(),
         t.elapsed().as_secs_f32()
     );
     assert_eq!(doc_vecs[0].len(), gemma2::EMBED_DIM);
-    eprintln!("\ncode  (rows: queries, columns: documents)");
+    say!("\ncode  (rows: queries, columns: documents)");
     for (qi, q) in queries.iter().enumerate() {
         let qv = shared
             .lock()
@@ -139,7 +170,7 @@ fn real_model_ranks_code_images_and_audio() {
             .encode_query(q)
             .expect("encode query");
         let scores: Vec<f32> = doc_vecs.iter().map(|d| dot(&qv, d)).collect();
-        eprintln!("  {scores:.3?}  {q}");
+        say!("  {scores:.3?}  {q}");
         let best = scores.iter().cloned().fold(f32::MIN, f32::max);
         assert_eq!(
             scores[qi], best,
@@ -161,11 +192,11 @@ fn real_model_ranks_code_images_and_audio() {
         let t = Instant::now();
         let v =
             embeddings::embed_media_file(&shared, &path, MediaKind::Image).expect("embed image");
-        eprintln!("{name}: {:.2}s", t.elapsed().as_secs_f32());
+        say!("{name}: {:.2}s", t.elapsed().as_secs_f32());
         assert!((dot(&v, &v) - 1.0).abs() < 1e-3);
         image_vecs.push(v);
     }
-    eprintln!("\nimages  (rows: queries, columns: images)");
+    say!("\nimages  (rows: queries, columns: images)");
     for (qi, (_, _, _, q)) in images.iter().enumerate() {
         let qv = shared
             .lock()
@@ -174,7 +205,7 @@ fn real_model_ranks_code_images_and_audio() {
             .unwrap()
             .expect("media query");
         let scores: Vec<f32> = image_vecs.iter().map(|d| dot(&qv, d)).collect();
-        eprintln!("  {scores:.3?}  {q}");
+        say!("  {scores:.3?}  {q}");
         let best = scores.iter().cloned().fold(f32::MIN, f32::max);
         // Colour and shape are about the simplest things a picture can
         // show. Getting these wrong means the pixels are reaching the
@@ -209,7 +240,7 @@ fn real_model_ranks_code_images_and_audio() {
         let t = Instant::now();
         let v =
             embeddings::embed_media_file(&shared, &path, MediaKind::Audio).expect("embed audio");
-        eprintln!("{name} (2 s): {:.2}s", t.elapsed().as_secs_f32());
+        say!("{name} (2 s): {:.2}s", t.elapsed().as_secs_f32());
         assert!((dot(&v, &v) - 1.0).abs() < 1e-3);
         audio_vecs.push(v);
     }
@@ -220,7 +251,7 @@ fn real_model_ranks_code_images_and_audio() {
     // Printed, not asserted: synthetic sounds are a weaker probe than
     // coloured shapes, and a wrong ranking here is a prompt to listen to
     // real clips, not proof of a bug.
-    eprintln!("\naudio  (rows: queries, columns: clips)");
+    say!("\naudio  (rows: queries, columns: clips)");
     for (_, _, q) in &clips {
         let qv = shared
             .lock()
@@ -229,6 +260,6 @@ fn real_model_ranks_code_images_and_audio() {
             .unwrap()
             .expect("media query");
         let scores: Vec<f32> = audio_vecs.iter().map(|d| dot(&qv, d)).collect();
-        eprintln!("  {scores:.3?}  {q}");
+        say!("  {scores:.3?}  {q}");
     }
 }

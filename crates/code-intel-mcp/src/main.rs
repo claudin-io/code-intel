@@ -568,7 +568,8 @@ fn usage() -> ! {
          The workspace defaults to $CODE_INTEL_WORKSPACE, then the cwd; the client's MCP roots\n\
          are indexed too. `index` builds the index and exits (warm a cache in CI, or debug).\n\
          Env: CODE_INTEL_CACHE_DIR, CODE_INTEL_EMBEDDINGS=0, CODE_INTEL_LOG=<filter>,\n\
-         \x20    CODE_INTEL_MODEL=auto|minilm|embeddinggemma2, CODE_INTEL_MEDIA=0.\n\
+         \x20    CODE_INTEL_MODEL=auto|minilm|embeddinggemma2, CODE_INTEL_MEDIA=0,\n\
+         \x20    CODE_INTEL_THREADS=<n>.\n\
          Cache: {}",
         env!("CARGO_PKG_VERSION"),
         workspace::default_cache_dir().display()

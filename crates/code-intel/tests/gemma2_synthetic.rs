@@ -294,18 +294,18 @@ fn workspace() -> tempfile::TempDir {
     std::fs::create_dir_all(ws.path().join("src")).unwrap();
     std::fs::create_dir_all(ws.path().join("assets")).unwrap();
     std::fs::write(
-        ws.path().join("src/upload.rs"),
+        ws.path().join("src").join("upload.rs"),
         "/// Retries a failed upload with exponential backoff until the server accepts it.\n\
          pub fn retry_failed_upload(attempts: u32) -> bool {\n    let mut delay = 100;\n    for _ in 0..attempts {\n        delay *= 2;\n    }\n    delay > 0\n}\n",
     )
     .unwrap();
     write_png(
-        &ws.path().join("assets/app-logo.png"),
+        &ws.path().join("assets").join("app-logo.png"),
         96,
         96,
         [240, 200, 20],
     );
-    write_wav(&ws.path().join("assets/error-beep.wav"), 880.0, 0.6);
+    write_wav(&ws.path().join("assets").join("error-beep.wav"), 880.0, 0.6);
     ws
 }
 
@@ -359,7 +359,7 @@ fn a_workspace_with_media_is_indexed_and_searchable() {
 
     // A query vector equal to the logo's own vector is the best possible
     // content match: it must come back, as a content hit, ahead of the beep.
-    let logo = ws.path().join("assets/app-logo.png");
+    let logo = ws.path().join("assets").join("app-logo.png");
     let logo_vec = embeddings::embed_media_file(&shared, &logo, MediaKind::Image).unwrap();
     let hits = db.search_media("zzz", Some(&logo_vec), 3).unwrap();
     assert!(!hits.is_empty());
@@ -451,7 +451,7 @@ fn media_gets_content_vectors_once_an_encoder_arrives() {
     assert_eq!(db.embedding_pending_files().unwrap(), 0);
 
     // An image that changes on disk is re-registered and re-embedded.
-    let logo = ws.path().join("assets/app-logo.png");
+    let logo = ws.path().join("assets").join("app-logo.png");
     write_png(&logo, 300, 100, [10, 10, 10]);
     {
         let mut guard = with_vision.lock().unwrap();

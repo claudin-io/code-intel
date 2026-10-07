@@ -1,0 +1,4 @@
+# ONNX graphs and their weight files are binary: a line-ending conversion on
+# checkout (the default on Windows) would corrupt them.
+*.onnx binary
+*.onnx_data binary

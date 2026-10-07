@@ -350,8 +350,9 @@ impl MiniLmEmbedder {
             // physical core) saturates the whole machine during indexing and
             // starves the WebView UI thread — Windows then flags the window
             // as "Not responding". Embedding is background work; keep it slow
-            // and polite.
-            .with_intra_threads(2)
+            // and polite. `CODE_INTEL_THREADS` raises the cap where there is
+            // no UI to starve.
+            .with_intra_threads(intra_threads())
             .map_err(|e| format!("ort intra threads: {e}"))?
             .with_inter_threads(1)
             .map_err(|e| format!("ort inter threads: {e}"))?
@@ -910,6 +911,22 @@ pub async fn ensure_model_downloaded(cache_dir: &Path) -> Result<(), String> {
 
 // ── the embedder the rest of the crate talks to ─────────────────────────
 
+/// Threads one model run may use. Two by default — indexing is a background
+/// job, and in Claudinio Code it shares the machine with a UI. A headless
+/// server on a many-core machine can afford more: `CODE_INTEL_THREADS`.
+pub const DEFAULT_INTRA_THREADS: usize = 2;
+
+pub fn intra_threads() -> usize {
+    parse_threads(std::env::var("CODE_INTEL_THREADS").ok().as_deref())
+}
+
+fn parse_threads(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=64).contains(n))
+        .unwrap_or(DEFAULT_INTRA_THREADS)
+}
+
 /// How MiniLM vectors are labelled in an index (see
 /// `IndexDb::reconcile_embedding_model`).
 pub const MINILM_MODEL_ID: &str = "all-MiniLM-L6-v2";
@@ -1268,6 +1285,16 @@ mod tests {
         let here = load_plan(ModelChoice::Auto, gemma2_supported());
         assert_eq!(here.contains(&Gemma2), cfg!(feature = "embeddings"));
         assert_eq!(here.last(), Some(&MiniLm));
+    }
+
+    #[test]
+    fn thread_cap_defaults_to_two_and_ignores_nonsense() {
+        assert_eq!(parse_threads(None), 2);
+        assert_eq!(parse_threads(Some("8")), 8);
+        assert_eq!(parse_threads(Some(" 4 ")), 4);
+        for bad in ["0", "-1", "many", "", "1000"] {
+            assert_eq!(parse_threads(Some(bad)), 2, "{bad:?}");
+        }
     }
 
     #[test]

@@ -192,11 +192,12 @@ fn build_session(path: &Path) -> Result<Session, String> {
     Session::builder()
         .map_err(|e| format!("ort builder: {e}"))?
         // Same settings and reasons as the MiniLM session: no retained
-        // buffers between runs, and two threads so indexing stays a
-        // background job instead of taking the whole machine.
+        // buffers between runs, and a thread cap (two unless
+        // `CODE_INTEL_THREADS` says otherwise) so indexing stays a background
+        // job instead of taking the whole machine.
         .with_memory_pattern(false)
         .map_err(|e| format!("ort memory pattern: {e}"))?
-        .with_intra_threads(2)
+        .with_intra_threads(crate::embeddings::intra_threads())
         .map_err(|e| format!("ort intra threads: {e}"))?
         .with_inter_threads(1)
         .map_err(|e| format!("ort inter threads: {e}"))?

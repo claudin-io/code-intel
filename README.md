@@ -146,6 +146,7 @@ eval on a pinned commit of it for every pull request and puts the report in the 
 | `CODE_INTEL_CACHE_DIR`, `--cache-dir <dir>` | where indexes, the model and the binary live |
 | `CODE_INTEL_EMBEDDINGS=0`, `--no-embeddings` | lexical only, no model download |
 | `CODE_INTEL_MODEL` | `auto` (default: EmbeddingGemma 2, MiniLM as fallback), `minilm`, or `embeddinggemma2` (no fallback — for comparing the two) |
+| `CODE_INTEL_THREADS` | threads one model run may use (default 2: indexing is a background job) |
 | `CODE_INTEL_MEDIA=0` | do not index images and audio at all |
 | `CODE_INTEL_MEDIA_MAX` | media files per workspace that get a content vector (default 200) |
 | `CODE_INTEL_IMAGE_TOKENS` | detail per image: `70`, `140`, `280` (default), `560`, `1120` — fewer is faster |

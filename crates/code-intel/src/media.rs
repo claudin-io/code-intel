@@ -230,7 +230,11 @@ mod tests {
         assert!(media_files(&root).is_empty());
 
         std::fs::create_dir_all(dir.path().join("assets")).unwrap();
-        std::fs::write(dir.path().join("assets/logo.png"), b"not really a png").unwrap();
+        std::fs::write(
+            dir.path().join("assets").join("logo.png"),
+            b"not really a png",
+        )
+        .unwrap();
         assert_eq!(
             detect_media_needs(&root),
             MediaNeeds {
@@ -243,12 +247,12 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join(".gitignore"), "build/\n").unwrap();
         std::fs::create_dir_all(dir.path().join("build")).unwrap();
-        std::fs::write(dir.path().join("build/beep.wav"), b"x").unwrap();
+        std::fs::write(dir.path().join("build").join("beep.wav"), b"x").unwrap();
         std::fs::create_dir_all(dir.path().join(".cache")).unwrap();
         std::fs::write(dir.path().join(".cache/beep.mp3"), b"x").unwrap();
         assert!(!detect_media_needs(&root).audio);
 
-        std::fs::write(dir.path().join("assets/click.ogg"), b"x").unwrap();
+        std::fs::write(dir.path().join("assets").join("click.ogg"), b"x").unwrap();
         let needs = detect_media_needs(&root);
         assert!(needs.images && needs.audio);
         let files = media_files(&root);

@@ -12,7 +12,7 @@ fn workspace_with_logos(n: usize) -> tempfile::TempDir {
     std::fs::create_dir_all(ws.path().join("src")).unwrap();
     std::fs::create_dir_all(ws.path().join("assets")).unwrap();
     std::fs::write(
-        ws.path().join("src/logo.rs"),
+        ws.path().join("src").join("logo.rs"),
         "/// Draws the logo at the requested size, scaled for the display density.\n\
          pub fn render_logo(size: u32) -> u32 { size * 2 }\n\n\
          /// Rendered logos by size, so a redraw does not rasterize again.\n\
@@ -23,7 +23,7 @@ fn workspace_with_logos(n: usize) -> tempfile::TempDir {
         // Not decodable — nothing here decodes; the index goes by name.
         std::fs::write(ws.path().join(format!("assets/logo-{i:02}.png")), b"png").unwrap();
     }
-    std::fs::write(ws.path().join("assets/startup-chime.wav"), b"wav").unwrap();
+    std::fs::write(ws.path().join("assets").join("startup-chime.wav"), b"wav").unwrap();
     ws
 }
 
@@ -93,7 +93,7 @@ fn media_never_crowds_code_out_of_the_symbol_tools() {
 fn rescans_follow_media_on_disk() {
     let ws = workspace_with_logos(3);
     let (_dbdir, db, root) = open(&ws);
-    let logo = ws.path().join("assets/logo-00.png");
+    let logo = ws.path().join("assets").join("logo-00.png");
     let logo_str = logo.to_string_lossy().to_string();
     let before = db.file_by_path(&logo_str).unwrap().expect("indexed");
     assert_eq!(before.language.as_deref(), Some("image"));
@@ -117,11 +117,11 @@ fn rescans_follow_media_on_disk() {
     );
 
     // The watcher's path for a deleted and for a new media file, no embedder.
-    let chime = ws.path().join("assets/startup-chime.wav");
+    let chime = ws.path().join("assets").join("startup-chime.wav");
     std::fs::remove_file(&chime).unwrap();
     indexer::reindex_file(&db, &chime.to_string_lossy(), None, Some(&root)).unwrap();
     assert_eq!(db.media_file_counts().unwrap(), (2, 0));
-    let added = ws.path().join("assets/banner.webp");
+    let added = ws.path().join("assets").join("banner.webp");
     std::fs::write(&added, b"webp").unwrap();
     indexer::reindex_file(&db, &added.to_string_lossy(), None, Some(&root)).unwrap();
     assert_eq!(db.media_file_counts().unwrap(), (3, 0));
@@ -177,7 +177,8 @@ fn db_with_vector(dim: usize, written_by: Option<&str>) -> (tempfile::TempDir, I
     let dbdir = tempfile::tempdir().unwrap();
     let db = IndexDb::open(&dbdir.path().join("index.db")).unwrap();
     if let Some(model) = written_by {
-        db.reconcile_embedding_model(model, dim, MediaNeeds::NONE).unwrap();
+        db.reconcile_embedding_model(model, dim, MediaNeeds::NONE)
+            .unwrap();
     }
     let fid = db.upsert_file("/ws/a.rs", "rust", "h1", 0, 10).unwrap();
     let sid = db

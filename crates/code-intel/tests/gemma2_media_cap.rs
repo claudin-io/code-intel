@@ -66,7 +66,7 @@ fn the_cap_is_respected_and_a_freed_slot_is_reused() {
     indexer::generate_all_embeddings(&db, &shared, None, &root).unwrap();
     assert_eq!(db.media_embedding_count().unwrap(), 1);
 
-    std::fs::remove_file(ws.path().join("assets/avatar.png")).unwrap();
+    std::fs::remove_file(ws.path().join("assets").join("avatar.png")).unwrap();
     indexer::scan_workspace(&db, &root, None, None, None).unwrap();
     assert_eq!(
         db.media_embedding_count().unwrap(),
