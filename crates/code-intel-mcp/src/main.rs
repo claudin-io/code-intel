@@ -24,6 +24,10 @@ const SNIPPET_TOP_HITS: usize = 5;
 const SNIPPET_MAX_LINES: usize = 40;
 const SNIPPET_MAX_CHARS: usize = 2400;
 
+/// Images/audio files listed next to the code results of one search. Few: an
+/// agent asking about code should not pay tokens for a gallery.
+const MEDIA_HITS: usize = 3;
+
 /// How long `semantic_search` waits for the embedding model before running
 /// the BM25 leg alone. Same value as the Claudinio Code agent tool.
 const MODEL_WAIT_MS: u64 = 5000;
@@ -149,6 +153,31 @@ fn attach_snippets(results: &mut [SemanticSearchResult]) {
             r.snippet = Some(snippet);
         }
     }
+}
+
+/// The model the workspace's vectors come from: the loaded embedder's, or —
+/// before it has loaded — whatever the index on disk was built with.
+fn embedding_model(ws: &Workspace) -> Option<String> {
+    ws.current_embedder()
+        .and_then(|e| e.lock().ok().map(|g| g.model_id().to_string()))
+        .or_else(|| ws.db.embedding_model())
+}
+
+/// Images and audio in the index, how many have a content vector (the rest
+/// match by file name only), and which encoders are loaded.
+fn media_status(ws: &Workspace) -> serde_json::Value {
+    let (images, audio) = ws.db.media_file_counts().unwrap_or((0, 0));
+    let support = ws
+        .current_embedder()
+        .and_then(|e| e.lock().ok().map(|g| g.media_support()))
+        .unwrap_or_default();
+    serde_json::json!({
+        "images": images,
+        "audio": audio,
+        "withContentVector": ws.db.media_embedding_count().unwrap_or(0),
+        "imageEncoder": support.images,
+        "audioEncoder": support.audio,
+    })
 }
 
 fn canonical(p: &Path) -> PathBuf {
@@ -302,7 +331,7 @@ impl CodeIntel {
 impl CodeIntel {
     #[tool(
         name = "index_status",
-        description = "State of the local code index: phase (indexing | embedding | lexical_only | ready | failed), scan/embedding progress and counts of indexed files, symbols and embeddings. Call this when a search tool says the index is not ready."
+        description = "State of the local code index: phase (indexing | embedding | lexical_only | ready | failed), scan/embedding progress, counts of indexed files, symbols and embeddings, the embedding model in use, and how many image/audio files are indexed. Call this when a search tool says the index is not ready."
     )]
     async fn index_status(
         &self,
@@ -326,6 +355,8 @@ impl CodeIntel {
                 "symbols": symbols,
                 "embeddings": embeddings,
                 "embeddingsPending": ws.db.embedding_pending_files().unwrap_or(0),
+                "embeddingModel": embedding_model(&ws),
+                "media": media_status(&ws),
                 "watcherWarning": ws.watcher_warning.lock().ok().and_then(|w| w.clone()),
                 "error": ws.error.lock().ok().and_then(|e| e.clone()),
                 "indexDb": ws.db_path,
@@ -394,7 +425,7 @@ impl CodeIntel {
 
     #[tool(
         name = "semantic_search",
-        description = "Hybrid code & documentation search: BM25 keyword matching over code bodies, docs and file paths, fused with MiniLM semantic embeddings. Finds code by exact identifiers, rare terms and file names AND by meaning/behavior — e.g. 'message queue system' finds a drain/push/queue implementation without an identifier match. Prefer this whenever you don't have a precise symbol name. The index is ENGLISH-ONLY: translate the query to English first. Response is {mode, note?, results}: mode is 'hybrid' or 'lexical-only' (while the embedding model loads), each result has score (relative confidence in (0,1]) and matchType ('hybrid'|'semantic'|'lexical'); the top results include a source snippet. Ranking: semantic_search → code_search (symbol names) → grep (fallback)."
+        description = "Hybrid code & documentation search: BM25 keyword matching over code bodies, docs and file paths, fused with semantic embeddings. Finds code by exact identifiers, rare terms and file names AND by meaning/behavior — e.g. 'message queue system' finds a drain/push/queue implementation without an identifier match. Prefer this whenever you don't have a precise symbol name. Write the query in English: code and docs are, and the fallback embedding model is English-only. Response is {mode, note?, results, media?}: mode is 'hybrid' or 'lexical-only' (while the embedding model loads), each result has score (relative confidence in (0,1]) and matchType ('hybrid'|'semantic'|'lexical'); the top results include a source snippet. `media`, when present, lists image/audio files of the project that match the query — by what they show or sound like when the multimodal model is loaded (see index_status), by file name otherwise. Ranking: semantic_search → code_search (symbol names) → grep (fallback)."
     )]
     async fn semantic_search(
         &self,
@@ -415,28 +446,34 @@ impl CodeIntel {
                 model = ws.current_embedder();
             }
         }
-        let query_vec: Option<Vec<f32>> = match model {
+        // Media vectors answer to a differently-prefixed query, so that one
+        // is only computed when the index has media vectors to compare it to.
+        let want_media_vec = ws.db.media_embedding_count().unwrap_or(0) > 0;
+        let (query_vec, media_vec): (Option<Vec<f32>>, Option<Vec<f32>>) = match model {
             Some(model) => {
                 let q = p.query.clone();
-                let vec = tokio::task::spawn_blocking(move || {
+                let vecs = tokio::task::spawn_blocking(move || {
                     let mut m = model.lock().map_err(|e| format!("embedder lock: {e}"))?;
-                    m.encode_query(&q)
+                    let code = m.encode_query(&q)?;
+                    let media = if want_media_vec { m.encode_media_query(&q)? } else { None };
+                    Ok::<_, String>((code, media))
                 })
                 .await
                 .map_err(|e| format!("encode task panicked: {e}"))?;
-                match vec {
-                    Ok(v) => Some(v),
+                match vecs {
+                    Ok((code, media)) => (Some(code), media),
                     Err(e) => {
                         tracing::warn!("query embedding failed, lexical only: {e}");
-                        None
+                        (None, None)
                     }
                 }
             }
-            None => None,
+            None => (None, None),
         };
 
         let mut results = ws.db.search_hybrid(&p.query, query_vec.as_deref(), limit)?;
         attach_snippets(&mut results);
+        let media = ws.db.search_media(&p.query, media_vec.as_deref(), MEDIA_HITS)?;
 
         let pending = ws.db.embedding_pending_files().unwrap_or(0);
         let mode = if query_vec.is_some() { "hybrid" } else { "lexical-only" };
@@ -456,6 +493,9 @@ impl CodeIntel {
             None
         };
         let mut envelope = serde_json::json!({ "mode": mode, "results": results });
+        if !media.is_empty() {
+            envelope["media"] = serde_json::json!(media);
+        }
         if let Some(n) = note {
             envelope["note"] = serde_json::json!(n);
         }
@@ -471,7 +511,7 @@ impl ServerHandler for CodeIntel {
                 Implementation::new("claudinio-code-intel", env!("CARGO_PKG_VERSION"))
                     .with_title("Claudinio Code Intel")
                     .with_description(
-                        "Local hybrid code search: tree-sitter symbols + BM25 + MiniLM embeddings. Nothing leaves the machine.",
+                        "Local hybrid code search: tree-sitter symbols + BM25 + embeddings (EmbeddingGemma 2, or MiniLM as fallback). Nothing leaves the machine.",
                     )
                     .with_website_url("https://github.com/claudin-io/code-intel"),
             )
@@ -527,7 +567,8 @@ fn usage() -> ! {
          \x20      claudinio-code-intel index [--workspace <dir>] [--cache-dir <dir>] [--no-embeddings]\n\n\
          The workspace defaults to $CODE_INTEL_WORKSPACE, then the cwd; the client's MCP roots\n\
          are indexed too. `index` builds the index and exits (warm a cache in CI, or debug).\n\
-         Env: CODE_INTEL_CACHE_DIR, CODE_INTEL_EMBEDDINGS=0, CODE_INTEL_LOG=<filter>.\n\
+         Env: CODE_INTEL_CACHE_DIR, CODE_INTEL_EMBEDDINGS=0, CODE_INTEL_LOG=<filter>,\n\
+         \x20    CODE_INTEL_MODEL=auto|minilm|embeddinggemma2, CODE_INTEL_MEDIA=0.\n\
          Cache: {}",
         env!("CARGO_PKG_VERSION"),
         workspace::default_cache_dir().display()
@@ -656,6 +697,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pretty(&serde_json::json!({
                 "workspace": ws.root, "phase": ws.phase(),
                 "files": files, "symbols": symbols, "embeddings": embeddings,
+                "embeddingModel": embedding_model(&ws),
+                "media": media_status(&ws),
                 "indexDb": ws.db_path,
                 "error": ws.error.lock().ok().and_then(|e| e.clone()),
             }))

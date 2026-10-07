@@ -8,8 +8,9 @@
 //! no embedding model still answers every tool, just lexically.
 
 use claudinio_code_intel::db::IndexDb;
-use claudinio_code_intel::embeddings::{self, SharedEmbedder};
+use claudinio_code_intel::embeddings::{self, ModelChoice, SharedEmbedder};
 use claudinio_code_intel::indexer::{self, IndexProgress};
+use claudinio_code_intel::media::{self, MediaNeeds};
 use claudinio_code_intel::watcher::{FileWatcher, WatchEvent};
 use claudinio_code_intel::{INDEX_SEMAPHORE, thread_priority};
 use std::path::{Path, PathBuf};
@@ -50,8 +51,8 @@ pub struct Workspace {
 }
 
 /// Machine-local cache root. Never inside the workspace: SQLite in WAL mode
-/// is unsupported over network filesystems, and one model per project is a
-/// 23 MB download per repo.
+/// is unsupported over network filesystems, and one model per project would
+/// be the same download again for every repo.
 pub fn default_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
@@ -79,10 +80,32 @@ pub fn index_db_path(cache_dir: &Path, workspace_root: &Path) -> PathBuf {
         .join(format!("{stem}-{hash:016x}.db"))
 }
 
-pub fn model_dir(cache_dir: &Path) -> PathBuf {
-    cache_dir
-        .join("models")
-        .join(embeddings::model_cache_dirname())
+/// Where model files live, one directory per model underneath.
+pub fn models_root(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("models")
+}
+
+/// The embedder is loaded once per process and shared by every workspace:
+/// EmbeddingGemma 2 is a few hundred megabytes resident, and two open roots
+/// must not mean two copies. Keyed by the models directory so a second cache
+/// (tests) gets its own.
+static EMBEDDER: tokio::sync::Mutex<Option<(PathBuf, SharedEmbedder)>> = tokio::sync::Mutex::const_new(None);
+
+/// The process's embedder, loading it on first use. `needs` is what this
+/// workspace's media calls for; an embedder loaded for an earlier workspace
+/// gains the encoders it lacks.
+async fn shared_embedder(models_root: &Path, needs: MediaNeeds) -> Result<SharedEmbedder, String> {
+    let mut slot = EMBEDDER.lock().await;
+    if let Some((root, shared)) = slot.as_ref()
+        && root == models_root
+    {
+        let shared = shared.clone();
+        embeddings::extend_media(&shared, needs).await;
+        return Ok(shared);
+    }
+    let shared = embeddings::ensure_and_load(models_root, ModelChoice::from_env(), needs).await?;
+    *slot = Some((models_root.to_path_buf(), shared.clone()));
+    Ok(shared)
 }
 
 impl Workspace {
@@ -138,13 +161,20 @@ impl Workspace {
     pub async fn run_pipeline(self: Arc<Self>, cache_dir: PathBuf, want_embeddings: bool) {
         let root_str = self.root.to_string_lossy().to_string();
 
-        // Model download in parallel with the scan: both are best-effort and
-        // independent, and the scan is what unblocks the first search.
-        let model_dir = model_dir(&cache_dir);
-        let download = if want_embeddings {
-            let md = model_dir.clone();
+        // Model download and load in parallel with the scan: both are
+        // best-effort and independent, and the scan is what unblocks the
+        // first search. Which media encoders to fetch is decided here, from
+        // what the workspace actually contains — a quick walk of file names,
+        // long before the scan gets to them. A text-only project downloads
+        // the text model and nothing else.
+        let model = if want_embeddings {
+            let root = root_str.clone();
+            let models = models_root(&cache_dir);
             Some(tokio::spawn(async move {
-                embeddings::ensure_model_downloaded(&md).await
+                let needs = spawn_blocking(move || media::detect_media_needs(&root))
+                    .await
+                    .unwrap_or(MediaNeeds::NONE);
+                shared_embedder(&models, needs).await
             }))
         } else {
             None
@@ -191,31 +221,19 @@ impl Workspace {
         // during it are not lost. It reads the embedder lazily per batch.
         self.start_watcher();
 
-        let embedder: Option<SharedEmbedder> = if want_embeddings {
-            if let Some(dl) = download {
-                match dl.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::warn!("embedding model download failed: {e}"),
-                    Err(e) => tracing::warn!("embedding model download task panicked: {e}"),
-                }
-            }
-            let md = model_dir.clone();
-            match spawn_blocking(move || embeddings::load_shared(&md)).await {
+        let embedder: Option<SharedEmbedder> = match model {
+            Some(task) => match task.await {
                 Ok(Ok(shared)) => Some(shared),
                 Ok(Err(e)) => {
-                    tracing::warn!("embedding model load failed: {e}");
-                    // Self-heal a corrupt download: the next run re-downloads
-                    // instead of failing the same way forever.
-                    let _ = std::fs::remove_dir_all(&model_dir);
+                    tracing::warn!("embedding model unavailable: {e}");
                     None
                 }
                 Err(e) => {
-                    tracing::warn!("embedding model load panicked: {e}");
+                    tracing::warn!("embedding model task panicked: {e}");
                     None
                 }
-            }
-        } else {
-            None
+            },
+            None => None,
         };
 
         let Some(shared) = embedder else {
@@ -223,6 +241,15 @@ impl Workspace {
             drop(permit);
             return;
         };
+        if let Ok(emb) = shared.lock() {
+            let media = emb.media_support();
+            tracing::info!(
+                model = emb.model_id(),
+                images = media.images,
+                audio = media.audio,
+                "embedding model ready"
+            );
+        }
         if let Ok(mut g) = self.embedder.lock() {
             *g = Some(shared.clone());
         }

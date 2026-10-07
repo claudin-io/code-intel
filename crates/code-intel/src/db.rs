@@ -1,3 +1,4 @@
+use crate::media::{MEDIA_KINDS_SQL, MediaKind, MediaNeeds};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::path::Path;
@@ -70,6 +71,30 @@ pub struct SemanticSearchResult {
     pub snippet: Option<String>,
 }
 
+/// An image or audio file matched by `IndexDb::search_media`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaSearchResult {
+    pub symbol_id: i64,
+    /// File name.
+    pub name: String,
+    /// "image" or "audio".
+    pub kind: String,
+    pub file_path: String,
+    pub score: f32,
+    /// "hybrid", "semantic" (content only) or "lexical" (file name only).
+    pub match_type: String,
+}
+
+/// What `IndexDb::reconcile_embedding_model` had to discard.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmbeddingReset {
+    /// The index held vectors of another model; all of them were dropped.
+    pub model_changed: bool,
+    /// Media files queued again because an encoder for them is now loaded.
+    pub media_requeued: i64,
+}
+
 /// One persisted retrieval chunk, as fed to the embedding pass.
 #[derive(Debug, Clone)]
 pub struct StoredChunk {
@@ -82,7 +107,14 @@ pub struct StoredChunk {
 
 /// Bump when the index format changes (schema, embedding layout, ignore
 /// rules). A mismatched on-disk index is deleted and rebuilt from scratch.
+///
+/// Not bumped for `index_meta` and media rows: both are additive, and a model
+/// change is handled by `reconcile_embedding_model`, which drops vectors only
+/// — a v7 index that stays on MiniLM keeps every one of its embeddings.
 const SCHEMA_VERSION: i64 = 7;
+
+const META_EMBED_MODEL: &str = "embed_model";
+const META_MEDIA_STATE: &str = "media_state";
 
 /// Tuning knobs for `search_hybrid_with`. `Default` holds the production
 /// values, calibrated with `examples/semantic_eval.rs --sweep` — re-run the
@@ -109,6 +141,33 @@ pub struct HybridParams {
     /// `required_token_matches`).
     pub min_bm25_term_matches: usize,
 }
+
+impl HybridParams {
+    /// The knobs for the model an index was embedded with. Cosine scores are
+    /// not comparable across models, so the vector gate is per model; the
+    /// rank-based fusion after it is not.
+    pub fn for_model(model_id: Option<&str>) -> Self {
+        let mut params = HybridParams::default();
+        if model_id.is_some_and(|m| m.starts_with("embeddinggemma-2")) {
+            params.min_cosine_candidate = GEMMA2_MIN_COSINE_CANDIDATE;
+        }
+        params
+    }
+}
+
+/// Vector gate for EmbeddingGemma 2. PROVISIONAL: the MiniLM value above came
+/// out of a sweep over real queries, this one did not — it is set a little
+/// under MiniLM's so the new model's vector leg is not starved before it has
+/// been measured. Run `semantic_eval --sweep` against this model and replace
+/// it with the measured value.
+const GEMMA2_MIN_COSINE_CANDIDATE: f32 = 0.35;
+
+/// Gate for an image or audio vector against a text query. Scores across
+/// modalities sit on their own scale: in the model's published example the
+/// right picture, clip and video score 0.73-0.76 against their query and the
+/// wrong ones 0.46-0.51. This is the midpoint, and PROVISIONAL in the same
+/// sense as the constant above.
+pub const MEDIA_MIN_COSINE: f32 = 0.60;
 
 impl Default for HybridParams {
     // Calibrated with `semantic_eval --sweep` on 2026-07-20 (59 positives /
@@ -434,6 +493,11 @@ impl IndexDb {
                 FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_symbol_chunks_symbol ON symbol_chunks(symbol_id);
+
+            CREATE TABLE IF NOT EXISTS index_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             ",
         )
         .map_err(|e| format!("schema: {e}"))?;
@@ -553,6 +617,172 @@ impl IndexDb {
         )
         .map_err(|e| format!("set embed_hash: {e}"))?;
         Ok(())
+    }
+
+    fn meta_get(conn: &Connection, key: &str) -> Option<String> {
+        conn.query_row("SELECT value FROM index_meta WHERE key = ?1", params![key], |row| row.get(0))
+            .ok()
+    }
+
+    fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+        conn.execute(
+            "INSERT INTO index_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .map(|_| ())
+        .map_err(|e| format!("set {key}: {e}"))
+    }
+
+    /// The model the stored vectors came from, if any are stored. An index
+    /// written before models were recorded can only hold MiniLM vectors.
+    pub fn embedding_model(&self) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+        Self::embedding_model_locked(&conn)
+    }
+
+    fn embedding_model_locked(conn: &Connection) -> Option<String> {
+        if let Some(model) = Self::meta_get(conn, META_EMBED_MODEL) {
+            return Some(model);
+        }
+        let any: i64 = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM symbol_embeddings)", [], |row| row.get(0))
+            .unwrap_or(0);
+        (any != 0).then(|| crate::embeddings::MINILM_MODEL_ID.to_string())
+    }
+
+    /// Make the index consistent with the embedder about to write to it.
+    ///
+    /// Vectors of two models cannot be compared, so if the index holds
+    /// another model's they are all dropped and every file queued for
+    /// embedding again — this is what happens the first time a workspace is
+    /// opened after the model changes, in either direction (including the
+    /// fallback to MiniLM). Stored vectors of any size other than `dim` count
+    /// as another model's too, whatever the recorded id says: an older
+    /// binary sharing this cache does not record what it writes.
+    ///
+    /// Media files are queued separately. One that got no vector — no
+    /// encoder for its kind was loaded, it was past the cap, it would not
+    /// decode — is marked done; whenever the loaded encoders, the cap or the
+    /// number of media vectors changes, those are queued again, without
+    /// touching any code vector. (The count is what gives a slot freed by a
+    /// deleted file to the next one, and it settles after one retry.)
+    ///
+    /// One transaction: a process killed halfway must not leave an index
+    /// whose vectors are gone but whose files still say "embedded".
+    pub fn reconcile_embedding_model(
+        &self,
+        model_id: &str,
+        dim: usize,
+        media: MediaNeeds,
+    ) -> Result<EmbeddingReset, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin reconcile: {e}"))?;
+        let mut reset = EmbeddingReset::default();
+
+        let stored = Self::embedding_model_locked(&tx);
+        let foreign_vectors: i64 = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM symbol_embeddings WHERE length(embedding) != ?1)",
+                params![(dim * 4) as i64],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if stored.as_deref().is_some_and(|s| s != model_id) || foreign_vectors != 0 {
+            eprintln!(
+                "[index] embedding model changed ({} -> {model_id}); re-embedding",
+                stored.as_deref().unwrap_or("unrecorded")
+            );
+            tx.execute("DELETE FROM symbol_embeddings", [])
+                .map_err(|e| format!("drop embeddings: {e}"))?;
+            tx.execute("UPDATE files SET embed_hash = NULL", [])
+                .map_err(|e| format!("requeue files: {e}"))?;
+            reset.model_changed = true;
+        }
+        Self::meta_set(&tx, META_EMBED_MODEL, model_id)?;
+
+        let mut kinds: Vec<&str> = MediaKind::ALL
+            .into_iter()
+            .filter(|k| media.has(*k))
+            .map(MediaKind::as_str)
+            .collect();
+        kinds.sort_unstable();
+        let media_vectors: i64 = tx
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM symbol_embeddings e
+                     JOIN symbols s ON s.id = e.symbol_id
+                     WHERE s.kind IN ({MEDIA_KINDS_SQL})"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let state = format!(
+            "{};max={};vectors={media_vectors}",
+            kinds.join(","),
+            crate::media::max_embedded_media()
+        );
+        if Self::meta_get(&tx, META_MEDIA_STATE).as_deref() != Some(state.as_str()) {
+            for kind in &kinds {
+                let n = tx
+                    .execute(
+                        "UPDATE files SET embed_hash = NULL
+                         WHERE language = ?1
+                           AND id NOT IN (SELECT s.file_id FROM symbols s
+                                          JOIN symbol_embeddings e ON e.symbol_id = s.id)",
+                        params![kind],
+                    )
+                    .map_err(|e| format!("requeue {kind} files: {e}"))?;
+                reset.media_requeued += n as i64;
+            }
+            Self::meta_set(&tx, META_MEDIA_STATE, &state)?;
+        }
+        tx.commit().map_err(|e| format!("commit reconcile: {e}"))?;
+        Ok(reset)
+    }
+
+    /// Media files that have a content vector.
+    pub fn media_embedding_count(&self) -> Result<i64, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            &format!(
+                "SELECT count(*) FROM symbol_embeddings e
+                 JOIN symbols s ON s.id = e.symbol_id
+                 WHERE s.kind IN ({MEDIA_KINDS_SQL})"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("media_embedding_count: {e}"))
+    }
+
+    /// Indexed media files, by kind: `(images, audio)`.
+    pub fn media_file_counts(&self) -> Result<(i64, i64), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let count = |kind: MediaKind| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM files WHERE language = ?1",
+                params![kind.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+        };
+        Ok((count(MediaKind::Image), count(MediaKind::Audio)))
+    }
+
+    /// The symbol row standing for a media file.
+    pub fn media_symbol_id(&self, file_id: i64) -> Result<Option<i64>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        Ok(conn
+            .query_row(
+                "SELECT id FROM symbols WHERE file_id = ?1 ORDER BY id LIMIT 1",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .ok())
     }
 
     /// Remove file rows (and, via cascade, their symbols/relations/embeddings)
@@ -675,6 +905,9 @@ impl IndexDb {
         Ok(())
     }
 
+    /// Symbols by name or signature. Code only: a project with thirty
+    /// `logo-*.png` must not answer "logo" with thirty pictures and no
+    /// function — media has its own search (`search_media`).
     pub fn search_symbols(&self, query: &str, limit: i64) -> Result<Vec<SearchResult>, String> {
         // Raw agent/user text goes through the sanitizing builder — FTS5
         // operator characters in a query used to be a syntax error here.
@@ -688,7 +921,7 @@ impl IndexDb {
                  FROM symbols_fts
                  JOIN symbols s ON s.id = symbols_fts.rowid
                  JOIN files f ON f.id = s.file_id
-                 WHERE symbols_fts MATCH ?1
+                 WHERE symbols_fts MATCH ?1 AND s.kind NOT IN ('image','audio')
                  ORDER BY rank
                  LIMIT ?2",
             )
@@ -723,7 +956,7 @@ impl IndexDb {
                 "SELECT s.id, s.name, s.kind, f.path, s.start_line, s.signature
                  FROM symbols s
                  JOIN files f ON f.id = s.file_id
-                 WHERE s.name = ?1 COLLATE NOCASE
+                 WHERE s.name = ?1 COLLATE NOCASE AND s.kind NOT IN ('image','audio')
                  ORDER BY f.path, s.start_line
                  LIMIT ?2",
             )
@@ -949,7 +1182,9 @@ impl IndexDb {
         Ok(results)
     }
 
-    /// Load a single page of embedding rows, ordered deterministically.
+    /// Load a single page of code/doc embedding rows, ordered
+    /// deterministically. Media rows are left to `search_media`: their scores
+    /// against a text query sit on another scale and would distort the ranks.
     pub fn load_embeddings_page(
         &self,
         page_size: i64,
@@ -964,6 +1199,7 @@ impl IndexDb {
                  FROM symbols s
                  JOIN files f ON f.id = s.file_id
                  JOIN symbol_embeddings e ON e.symbol_id = s.id
+                 WHERE s.kind NOT IN ('image','audio')
                  ORDER BY s.id, e.start_line
                  LIMIT ? OFFSET ?",
             )
@@ -1070,8 +1306,10 @@ impl IndexDb {
 
     /// BM25 leg: weighted match over chunk_fts, reduced to the best-ranked
     /// chunk per symbol (rows arrive rank-ordered, so first wins).
-    fn bm25_leg_candidates(&self, match_query: &str, k: usize) -> Result<Vec<LegHit>, String> {
+    fn bm25_leg_candidates(&self, match_query: &str, k: usize, media: bool) -> Result<Vec<LegHit>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        // Code and media are ranked apart (see `search_media`).
+        let media_filter = if media { "" } else { "NOT" };
         let sql = format!(
             "SELECT c.symbol_id, s.name, s.kind, s.signature, f.path,
                     s.start_line, s.end_line, c.start_line, c.end_line,
@@ -1080,7 +1318,7 @@ impl IndexDb {
              JOIN symbol_chunks c ON c.id = chunk_fts.rowid
              JOIN symbols s ON s.id = c.symbol_id
              JOIN files f ON f.id = s.file_id
-             WHERE chunk_fts MATCH ?1
+             WHERE chunk_fts MATCH ?1 AND s.kind {media_filter} IN ({MEDIA_KINDS_SQL})
              ORDER BY bm25(chunk_fts, {BM25_W_NAME}, {BM25_W_PATH}, {BM25_W_BODY})
              LIMIT ?2"
         );
@@ -1126,7 +1364,154 @@ impl IndexDb {
         query_vec: Option<&[f32]>,
         limit: usize,
     ) -> Result<Vec<SemanticSearchResult>, String> {
-        self.search_hybrid_with(query_text, query_vec, limit, &HybridParams::default())
+        let params = HybridParams::for_model(self.embedding_model().as_deref());
+        self.search_hybrid_with(query_text, query_vec, limit, &params)
+    }
+
+    /// Images and audio matching a query: by content, when `query_vec` (from
+    /// `CodeEmbedder::encode_media_query`) is given and the files have
+    /// vectors, and by file name and path. Kept out of `search_hybrid` so
+    /// that code ranking is untouched by it; the two legs are fused the same
+    /// way, so `score` reads the same in both result lists.
+    pub fn search_media(
+        &self,
+        query_text: &str,
+        query_vec: Option<&[f32]>,
+        limit: usize,
+    ) -> Result<Vec<MediaSearchResult>, String> {
+        const K: usize = 20;
+        const RRF_K: f32 = 60.0;
+        let tokens = tokenize_query(query_text);
+
+        let mut vector_hits: Vec<LegHit> = Vec::new();
+        if let Some(qv) = query_vec {
+            let conn = self.conn.lock().map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT s.id, s.name, s.kind, f.path, e.embedding
+                     FROM symbol_embeddings e
+                     JOIN symbols s ON s.id = e.symbol_id
+                     JOIN files f ON f.id = s.file_id
+                     WHERE s.kind IN ({MEDIA_KINDS_SQL})"
+                ))
+                .map_err(|e| format!("prepare media scan: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                    ))
+                })
+                .map_err(|e| format!("query media scan: {e}"))?;
+            for (symbol_id, name, kind, file_path, blob) in rows.filter_map(|r| r.ok()) {
+                if blob.len() != qv.len() * 4 {
+                    continue;
+                }
+                let dot: f32 = blob
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(qv.iter())
+                    .map(|(bytes, q)| f32::from_le_bytes(*bytes) * q)
+                    .sum();
+                if dot < MEDIA_MIN_COSINE {
+                    continue;
+                }
+                vector_hits.push(LegHit {
+                    symbol_id,
+                    name,
+                    kind,
+                    signature: None,
+                    file_path,
+                    sym_start_line: 0,
+                    sym_end_line: 0,
+                    chunk_start: 0,
+                    chunk_end: 0,
+                    cosine: dot,
+                    fts_text: String::new(),
+                });
+            }
+            vector_hits.sort_by(|a, b| {
+                b.cosine
+                    .partial_cmp(&a.cosine)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.symbol_id.cmp(&b.symbol_id))
+            });
+            vector_hits.truncate(K);
+        }
+
+        // A file name is thin evidence, so a name-only hit needs the same
+        // share of the query's words a code hit does; one the content leg
+        // also found needs none.
+        let vector_ids: std::collections::HashSet<i64> = vector_hits.iter().map(|h| h.symbol_id).collect();
+        let required = required_token_matches(tokens.len(), HybridParams::default().min_bm25_term_matches);
+        let lexical_hits: Vec<LegHit> = match build_fts_match_query(query_text) {
+            Some(mq) => self
+                .bm25_leg_candidates(&mq, K, true)?
+                .into_iter()
+                .filter(|h| vector_ids.contains(&h.symbol_id) || bm25_only_hit_has_evidence(&tokens, h, required))
+                .collect(),
+            None => vec![],
+        };
+
+        struct Fused {
+            hit: LegHit,
+            rrf: f32,
+            in_vector: bool,
+            in_lexical: bool,
+        }
+        let mut fused: Vec<Fused> = Vec::new();
+        for (i, hit) in vector_hits.into_iter().enumerate() {
+            fused.push(Fused {
+                hit,
+                rrf: 1.0 / (RRF_K + (i + 1) as f32),
+                in_vector: true,
+                in_lexical: false,
+            });
+        }
+        for (i, hit) in lexical_hits.into_iter().enumerate() {
+            let contrib = 1.0 / (RRF_K + (i + 1) as f32);
+            match fused.iter_mut().find(|f| f.hit.symbol_id == hit.symbol_id) {
+                Some(f) => {
+                    f.rrf += contrib;
+                    f.in_lexical = true;
+                }
+                None => fused.push(Fused {
+                    hit,
+                    rrf: contrib,
+                    in_vector: false,
+                    in_lexical: true,
+                }),
+            }
+        }
+        let norm = 2.0 / (RRF_K + 1.0);
+        let mut results: Vec<MediaSearchResult> = fused
+            .into_iter()
+            .map(|f| MediaSearchResult {
+                symbol_id: f.hit.symbol_id,
+                name: f.hit.name,
+                kind: f.hit.kind,
+                file_path: f.hit.file_path,
+                score: (f.rrf / norm).clamp(0.0, 1.0),
+                match_type: match (f.in_vector, f.in_lexical) {
+                    (true, true) => "hybrid",
+                    (true, false) => "semantic",
+                    _ => "lexical",
+                }
+                .to_string(),
+            })
+            .collect();
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.symbol_id.cmp(&b.symbol_id))
+        });
+        results.truncate(limit);
+        Ok(results)
     }
 
     /// Hybrid retrieval: BM25 over chunk_fts fused with cosine over
@@ -1153,7 +1538,7 @@ impl IndexDb {
             None => vec![],
         };
         let bm25_hits = match &match_query {
-            Some(mq) => self.bm25_leg_candidates(mq, params.k_candidates)?,
+            Some(mq) => self.bm25_leg_candidates(mq, params.k_candidates, false)?,
             None => vec![],
         };
 

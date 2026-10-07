@@ -2,9 +2,15 @@
 //!
 //! `parser` turns source into symbols with tree-sitter (77 grammars), `db`
 //! keeps them in SQLite next to an FTS5 table and embedding rows, `embeddings`
-//! runs all-MiniLM-L6-v2 in-process, and `IndexDb::search_hybrid` fuses BM25
-//! and vector ranks with reciprocal rank fusion. Code is never sent anywhere
-//! to be indexed.
+//! runs the embedding model in-process, and `IndexDb::search_hybrid` fuses
+//! BM25 and vector ranks with reciprocal rank fusion. Code is never sent
+//! anywhere to be indexed.
+//!
+//! The embedding model is EmbeddingGemma 2 in the ONNX Runtime build
+//! (`gemma2`: text, plus images and audio when the workspace has any) and
+//! all-MiniLM-L6-v2 everywhere else — and wherever the larger model cannot be
+//! downloaded or loaded. `media` lists a workspace's images and audio;
+//! `media_prep` decodes them for the encoders.
 //!
 //! Extracted from `claudin-io/claudinio-code` `src-tauri/src/code_intel/`; the
 //! only change is that progress is reported through [`indexer::ProgressSink`]
@@ -15,7 +21,12 @@ pub mod db;
 pub mod download;
 pub mod embeddings;
 pub mod fallback;
+#[cfg(feature = "embeddings")]
+pub mod gemma2;
 pub mod indexer;
+pub mod media;
+#[cfg(feature = "embeddings")]
+pub mod media_prep;
 pub mod parser;
 pub mod text;
 pub mod thread_priority;

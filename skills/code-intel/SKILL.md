@@ -7,9 +7,10 @@ description: Navigate and search the workspace with the code-intel MCP tools (se
 
 The `code-intel` MCP server keeps a local index of this workspace: every
 symbol tree-sitter can extract (77 languages), a BM25 full-text index over
-code bodies, docs and paths, and MiniLM embeddings of each chunk. Hybrid
-search fuses the two. The index lives in the OS cache directory, never in the
-repo, and nothing is sent anywhere.
+code bodies, docs and paths, and an embedding of each chunk. Hybrid search
+fuses the two. The project's images and audio files are indexed too. The
+index lives in the OS cache directory, never in the repo, and nothing is sent
+anywhere.
 
 ## Pick the tool
 
@@ -21,7 +22,8 @@ repo, and nothing is sent anywhere.
 | A definition by exact name | `symbol_lookup` | grep |
 | What a file contains before reading it | `file_outline` | reading the whole file |
 | Who calls / references a function | `find_callers` | grep for the name |
-| Whether the index is warm | `index_status` | guessing |
+| An image or sound in the project ("the app logo", "error beep") | `semantic_search` → `media` | listing asset folders |
+| Whether the index is warm, and which embedding model it uses | `index_status` | guessing |
 
 Order of preference for "where is X?": `semantic_search` → `code_search` →
 grep as the fallback. Reach for grep when you need every textual occurrence
@@ -29,8 +31,9 @@ grep as the fallback. Reach for grep when you need every textual occurrence
 
 ## How to query
 
-- **English only.** The embedding model is English; translate the request
-  first, even when the user wrote in another language.
+- **Query in English.** Code and docs are English, and the fallback
+  embedding model understands nothing else; translate the request first,
+  even when the user wrote in another language.
 - Describe the *behaviour* for `semantic_search`: "rate limit a client by
   hourly spend" beats "limit". Identifiers and file names work too — the BM25
   leg matches them exactly.
@@ -40,14 +43,23 @@ grep as the fallback. Reach for grep when you need every textual occurrence
 
 ## Reading the results
 
-`semantic_search` returns `{mode, note?, results}`.
+`semantic_search` returns `{mode, note?, results, media?}`.
 
 - `mode: "hybrid"` — embeddings were used. `score` is relative confidence in
   (0, 1]; `matchType` says whether a hit came from both legs, only semantic
   or only lexical.
-- `mode: "lexical-only"` — the model is still loading (first run downloads
-  ~23 MB) or embeddings are still being generated. Keyword hits are still
-  good; re-run later for the semantic ranking. `note` explains which.
+- `mode: "lexical-only"` — the model is still loading (the first run
+  downloads it: ~175 MB, or 23 MB for the fallback model) or embeddings are
+  still being generated. Keyword hits are still good; re-run later for the
+  semantic ranking. `note` explains which.
+- `media` — up to three image/audio files of the project that match the
+  query, each with `filePath`, `kind` (`image` | `audio`), `score` and
+  `matchType`. `semantic` and `hybrid` mean the file's *content* matched
+  (what the picture shows, what the clip sounds like); `lexical` means only
+  its name or path did. Content matching needs the multimodal model:
+  `index_status` reports `embeddingModel` and, under `media`, whether the
+  image and audio encoders are loaded. The list is absent when nothing
+  matches — most code questions.
 
 ## When the index is not ready
 

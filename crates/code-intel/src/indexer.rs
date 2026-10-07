@@ -1,7 +1,8 @@
-use crate::db::IndexDb;
+use crate::db::{FileRecord, IndexDb};
 use crate::embeddings::{
     CodeEmbedder, EmbedChunk, SharedEmbedder, build_embedding_chunks, build_embedding_text,
 };
+use crate::media::{self, MediaKind};
 use crate::parser::{self, ParseResult};
 use serde::Serialize;
 use std::time::SystemTime;
@@ -451,6 +452,79 @@ fn encode_and_store_batched(db: &IndexDb, emb: &mut CodeEmbedder, chunks: &[(i64
     }
 }
 
+/// Register an image or audio file in the index: one file row, one symbol
+/// named after the file (kind `image` / `audio`), and one chunk whose FTS
+/// fields are the file's name and path words. That alone makes it findable by
+/// name in every build; its content vector, where an encoder exists, is added
+/// by the embedding pass. Returns whether anything changed.
+///
+/// The file is not read here — its identity is size and modification time,
+/// to the nanosecond where the filesystem keeps it: an image re-exported at
+/// the same dimensions has the same size and often the same second — so
+/// listing ten thousand images costs ten thousand `stat` calls.
+pub fn index_media_file(db: &IndexDb, path: &str, kind: MediaKind) -> Result<bool, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("stat {path}: {e}"))?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .unwrap_or_default();
+    let mtime = modified.as_secs();
+    let hash = format!("media:{}:{}", meta.len(), modified.as_nanos());
+    if let Some(existing) = db.file_by_path(path)?
+        && existing.hash.as_deref() == Some(hash.as_str())
+        && existing.language.as_deref() == Some(kind.as_str())
+    {
+        return Ok(false);
+    }
+
+    let file_id = db.upsert_file(path, kind.as_str(), &hash, mtime as i64, meta.len() as i64)?;
+    db.delete_symbols_for_file(file_id)?;
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    let symbol_id = db.insert_symbol(file_id, &name, kind.as_str(), None, 1, 0, 1, 0, None)?;
+    let chunks: Vec<(i64, EmbedChunk)> =
+        build_embedding_chunks(kind.as_str(), &name, path, None, None, None, 1, 1, None)
+            .into_iter()
+            .map(|c| (symbol_id, c))
+            .collect();
+    store_chunks(db, &chunks);
+    Ok(true)
+}
+
+/// Turns a media file into its content vector.
+type MediaEmbedFn<'a> = &'a mut dyn FnMut(&std::path::Path) -> Result<Vec<f32>, String>;
+
+/// Give a registered media file its content vector, if `embed` is offered,
+/// and mark it done either way. A file that cannot be decoded, is over the
+/// size limit or falls past the per-workspace cap stays findable by name; it
+/// is tried again when it changes, or when the loaded encoders do (see
+/// `IndexDb::reconcile_embedding_model`). Returns whether a vector was stored.
+fn embed_media_row(
+    db: &IndexDb,
+    file: &FileRecord,
+    kind: MediaKind,
+    embed: Option<MediaEmbedFn<'_>>,
+) -> bool {
+    let Some(hash) = file.hash.as_deref() else {
+        return false;
+    };
+    let mut stored = false;
+    if let Some(embed) = embed
+        && file.size as u64 <= media::max_bytes(kind)
+        && let Ok(Some(symbol_id)) = db.media_symbol_id(file.id)
+    {
+        match embed(std::path::Path::new(&file.path)) {
+            Ok(vector) => stored = db.upsert_embedding(symbol_id, 0, 0, 0, &vector).is_ok(),
+            Err(e) => eprintln!("[embeddings] {} left without a content vector: {e}", file.path),
+        }
+    }
+    let _ = db.set_embed_hash(file.id, hash);
+    stored
+}
+
 pub fn scan_workspace(
     db: &IndexDb,
     root: &str,
@@ -461,6 +535,12 @@ pub fn scan_workspace(
     let mut total_files = 0i64;
     let mut total_symbols = 0i64;
     let mut counted = 0i64;
+
+    // A scan given an embedder writes vectors as it goes, so the index must
+    // agree with that embedder's model before the first one lands.
+    if let Some(emb) = embedder.as_deref() {
+        db.reconcile_embedding_model(emb.model_id(), emb.embedding_dim(), emb.media_support())?;
+    }
 
     // Resolved once per scan; empty when the project has no locale resources,
     // in which case chunk texts are unchanged.
@@ -674,10 +754,26 @@ pub fn scan_workspace(
         }
     }
 
+    // ── Third pass: images and audio ─────────────────────────────────────
+    // Registered by name only; the embedding pass adds content vectors when
+    // the loaded model has an encoder for them.
+    let media_paths = media::media_files(root);
+    for (path_str, kind) in &media_paths {
+        match index_media_file(db, path_str, *kind) {
+            Ok(_) => {
+                total_files += 1;
+                total_symbols += 1;
+            }
+            Err(e) => eprintln!("[indexer] {e}"),
+        }
+    }
+    let grand_total = grand_total + media_paths.len() as i64;
+
     // Drop rows for files no longer in the scan set (deleted files, or junk
     // like node_modules/dist indexed before ignore rules existed).
     let mut keep: std::collections::HashSet<String> = all_paths.iter().cloned().collect();
     keep.extend(doc_paths);
+    keep.extend(media_paths.into_iter().map(|(p, _)| p));
     match db.prune_files_not_in(&keep) {
         Ok(pruned) if pruned > 0 => eprintln!("[indexer] pruned {pruned} stale files from index"),
         Ok(_) => {}
@@ -707,11 +803,24 @@ pub fn generate_all_embeddings(
     progress: Option<ProgressSink<'_>>,
     workspace: &str,
 ) -> Result<(i64, i64), String> {
+    // Before anything is read or written: vectors of another model are
+    // dropped, and media files a newly loaded encoder can now describe are
+    // queued again.
+    let (model_id, dim, media_support) = {
+        let emb = embedder
+            .lock()
+            .map_err(|e| format!("embedder lock poisoned: {e}"))?;
+        (emb.model_id(), emb.embedding_dim(), emb.media_support())
+    };
+    db.reconcile_embedding_model(model_id, dim, media_support)?;
+
     let files = db.all_files()?;
     let total = files.len() as i64;
     let mut processed = 0i64;
     let mut total_embeddings = 0i64;
     let mut failed = 0i64;
+    let media_cap = media::max_embedded_media() as i64;
+    let mut media_embedded = db.media_embedding_count().unwrap_or(0);
 
     for file in &files {
         processed += 1;
@@ -720,6 +829,18 @@ pub fn generate_all_embeddings(
         // what keeps re-opening a workspace from re-embedding every symbol
         // in it every time.
         if file.hash.is_some() && file.embed_hash == file.hash {
+            continue;
+        }
+
+        if let Some(kind) = file.language.as_deref().and_then(MediaKind::parse) {
+            let mut embed = |path: &std::path::Path| crate::embeddings::embed_media_file(embedder, path, kind);
+            let offered = media_support.has(kind) && media_embedded < media_cap;
+            if embed_media_row(db, file, kind, offered.then_some(&mut embed)) {
+                media_embedded += 1;
+                total_embeddings += 1;
+                // Same breather as between text batches below.
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
             continue;
         }
 
@@ -809,6 +930,38 @@ pub fn reindex_file(
     workspace_root: Option<&str>,
 ) -> Result<Option<ParseResult>, String> {
     let existing = db.file_by_path(path)?;
+
+    // Media is binary: it must never reach `read_to_string` below, which
+    // would fail and delete the row as if the file were gone.
+    if let Some(kind) = media::media_kind(path) {
+        if !media::media_enabled() {
+            return Ok(None);
+        }
+        if !std::path::Path::new(path).is_file() {
+            if existing.is_some() {
+                let _ = db.delete_file(path);
+            }
+            return Ok(None);
+        }
+        if !index_media_file(db, path, kind)? {
+            return Ok(None);
+        }
+        if let Some(emb) = embedder
+            && let Some(file) = db.file_by_path(path)?
+        {
+            let offered = emb.media_support().has(kind)
+                && db.media_embedding_count().unwrap_or(0) < media::max_embedded_media() as i64;
+            let mut embed = |p: &std::path::Path| emb.embed_media_file(p, kind);
+            embed_media_row(db, &file, kind, offered.then_some(&mut embed));
+        }
+        return Ok(Some(ParseResult {
+            language: kind.as_str().into(),
+            symbols: vec![],
+            calls: vec![],
+            error: None,
+        }));
+    }
+
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => {

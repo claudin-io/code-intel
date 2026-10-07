@@ -1,5 +1,6 @@
 #[cfg(feature = "embeddings")]
 use ort::{session::Session, value::Tensor};
+use crate::media::{MediaKind, MediaNeeds};
 use std::path::Path;
 #[cfg(any(feature = "embeddings", feature = "embeddings-candle"))]
 use tokenizers::Tokenizer;
@@ -112,7 +113,7 @@ pub fn model_filename() -> &'static str {
 const MAX_LENGTH: usize = 512;
 
 #[cfg(feature = "embeddings")]
-pub struct CodeEmbedder {
+pub struct MiniLmEmbedder {
     session: Session,
     tokenizer: Tokenizer,
     output_name: String,
@@ -130,14 +131,14 @@ pub struct CodeEmbedder {
 /// Produces the same 384-dim mean-pooled + L2-normalized vectors as the ORT
 /// path, from the same all-MiniLM-L6-v2 weights (safetensors instead of ONNX).
 #[cfg(all(feature = "embeddings-candle", not(feature = "embeddings")))]
-pub struct CodeEmbedder {
+pub struct MiniLmEmbedder {
     model: candle_transformers::models::bert::BertModel,
     tokenizer: Tokenizer,
     device: candle_core::Device,
 }
 
 #[cfg(all(feature = "embeddings-candle", not(feature = "embeddings")))]
-impl CodeEmbedder {
+impl MiniLmEmbedder {
     pub fn load(model_dir: &Path) -> Result<Self, String> {
         use candle_core::{DType, Device};
         use candle_nn::VarBuilder;
@@ -174,7 +175,7 @@ impl CodeEmbedder {
         let tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|e| format!("tokenizer load: {e}"))?;
 
-        Ok(CodeEmbedder {
+        Ok(MiniLmEmbedder {
             model,
             tokenizer,
             device,
@@ -295,12 +296,12 @@ impl CodeEmbedder {
 /// Construction always fails, so callers fall back to their existing
 /// "embedding model unavailable" path and the app runs without semantic search.
 #[cfg(not(any(feature = "embeddings", feature = "embeddings-candle")))]
-pub struct CodeEmbedder {
+pub struct MiniLmEmbedder {
     _never: std::convert::Infallible,
 }
 
 #[cfg(not(any(feature = "embeddings", feature = "embeddings-candle")))]
-impl CodeEmbedder {
+impl MiniLmEmbedder {
     const DISABLED: &'static str =
         "semantic search disabled: built without the `embeddings` feature (no ONNX Runtime)";
 
@@ -319,7 +320,7 @@ impl CodeEmbedder {
 }
 
 #[cfg(feature = "embeddings")]
-impl CodeEmbedder {
+impl MiniLmEmbedder {
     pub fn load(model_dir: &Path) -> Result<Self, String> {
         let model_path = model_dir.join(ACTIVE_MODEL.model_filename);
         let tokenizer_path = model_dir.join(ACTIVE_MODEL.tokenizer_filename);
@@ -374,7 +375,7 @@ impl CodeEmbedder {
             .iter()
             .any(|i| i.name() == "token_type_ids");
 
-        Ok(CodeEmbedder {
+        Ok(MiniLmEmbedder {
             session,
             tokenizer,
             output_name,
@@ -907,16 +908,377 @@ pub async fn ensure_model_downloaded(cache_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// ── the embedder the rest of the crate talks to ─────────────────────────
+
+/// How MiniLM vectors are labelled in an index (see
+/// `IndexDb::reconcile_embedding_model`).
+pub const MINILM_MODEL_ID: &str = "all-MiniLM-L6-v2";
+
+/// Size of a MiniLM vector (its hidden size; the model has no projection).
+pub const MINILM_DIM: usize = 384;
+
+enum Engine {
+    MiniLm(Box<MiniLmEmbedder>),
+    #[cfg(feature = "embeddings")]
+    Gemma2(Box<crate::gemma2::Gemma2Embedder>),
+}
+
+/// Whichever embedding model this process ended up with.
+///
+/// Every build has MiniLM: text only, 384 dimensions, 23 MB. The ONNX Runtime
+/// build prefers EmbeddingGemma 2, which also places images and audio in the
+/// same space as text, and keeps MiniLM as the fallback for when that model
+/// cannot be downloaded or loaded. Callers do not branch on which one they
+/// got: the index records `model_id`, and media calls simply report that the
+/// model at hand cannot do them.
+pub struct CodeEmbedder {
+    engine: Engine,
+}
+
+const NO_MEDIA: &str = "the loaded embedding model has no encoder for this kind of file";
+
+impl CodeEmbedder {
+    /// MiniLM from `model_dir` — what this function has always loaded.
+    pub fn load(model_dir: &Path) -> Result<Self, String> {
+        Ok(CodeEmbedder {
+            engine: Engine::MiniLm(Box::new(MiniLmEmbedder::load(model_dir)?)),
+        })
+    }
+
+    /// EmbeddingGemma 2's text model from `model_dir`.
+    #[cfg(feature = "embeddings")]
+    pub fn load_gemma2(model_dir: &Path) -> Result<Self, String> {
+        Ok(CodeEmbedder {
+            engine: Engine::Gemma2(Box::new(crate::gemma2::Gemma2Embedder::load(model_dir)?)),
+        })
+    }
+
+    /// Identifies the vectors this embedder produces. Vectors of different
+    /// ids are not comparable and never share an index.
+    pub fn model_id(&self) -> &'static str {
+        match &self.engine {
+            Engine::MiniLm(_) => MINILM_MODEL_ID,
+            #[cfg(feature = "embeddings")]
+            Engine::Gemma2(_) => crate::gemma2::MODEL_ID,
+        }
+    }
+
+    /// Length of every vector this embedder produces.
+    pub fn embedding_dim(&self) -> usize {
+        match &self.engine {
+            Engine::MiniLm(_) => MINILM_DIM,
+            #[cfg(feature = "embeddings")]
+            Engine::Gemma2(_) => crate::gemma2::EMBED_DIM,
+        }
+    }
+
+    /// Embed index texts (code chunks, doc sections).
+    pub fn encode(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+        match &mut self.engine {
+            Engine::MiniLm(m) => m.encode(texts),
+            #[cfg(feature = "embeddings")]
+            Engine::Gemma2(g) => g.encode_documents(texts),
+        }
+    }
+
+    /// Embed a search query, to compare against `encode` vectors.
+    pub fn encode_query(&mut self, text: &str) -> Result<Vec<f32>, String> {
+        match &mut self.engine {
+            Engine::MiniLm(m) => m.encode_query(text),
+            #[cfg(feature = "embeddings")]
+            Engine::Gemma2(g) => g.encode_query(text, crate::gemma2::QueryTask::Code),
+        }
+    }
+
+    /// Embed a search query to compare against image and audio vectors.
+    /// `None` when the model has no shared text/media space at all.
+    pub fn encode_media_query(&mut self, text: &str) -> Result<Option<Vec<f32>>, String> {
+        match &mut self.engine {
+            Engine::MiniLm(_) => {
+                let _ = text;
+                Ok(None)
+            }
+            #[cfg(feature = "embeddings")]
+            Engine::Gemma2(g) => g.encode_query(text, crate::gemma2::QueryTask::Media).map(Some),
+        }
+    }
+
+    /// The kinds of media this embedder can turn into vectors right now.
+    pub fn media_support(&self) -> MediaNeeds {
+        match &self.engine {
+            Engine::MiniLm(_) => MediaNeeds::NONE,
+            #[cfg(feature = "embeddings")]
+            Engine::Gemma2(g) => g.media_support(),
+        }
+    }
+
+    /// Embed one image or audio file. Holds the embedder for the whole run —
+    /// right for the watcher's one file at a time; bulk indexing uses the
+    /// free function `embed_media_file`, which lets searches in between.
+    pub fn embed_media_file(&mut self, path: &Path, kind: MediaKind) -> Result<Vec<f32>, String> {
+        match &mut self.engine {
+            Engine::MiniLm(_) => {
+                let _ = (path, kind);
+                Err(NO_MEDIA.into())
+            }
+            #[cfg(feature = "embeddings")]
+            Engine::Gemma2(g) => {
+                if !g.media_support().has(kind) {
+                    return Err(NO_MEDIA.into());
+                }
+                let soft = crate::gemma2::encode_media_file(&g.encoders(), path, kind)?;
+                g.embed_soft_tokens(kind, &soft)
+            }
+        }
+    }
+}
+
 pub type SharedEmbedder = std::sync::Arc<std::sync::Mutex<CodeEmbedder>>;
 
+/// MiniLM from `cache_dir`, shared.
 pub fn load_shared(cache_dir: &Path) -> Result<SharedEmbedder, String> {
     let embedder = CodeEmbedder::load(cache_dir)?;
     Ok(std::sync::Arc::new(std::sync::Mutex::new(embedder)))
 }
 
+/// Embed one media file with a shared embedder. Decoding and the encoder run
+/// — seconds for an image — happen outside the embedder's lock, which is
+/// taken only for the short text-model pass at the end, so a search issued
+/// meanwhile is not held up.
+pub fn embed_media_file(shared: &SharedEmbedder, path: &Path, kind: MediaKind) -> Result<Vec<f32>, String> {
+    #[cfg(feature = "embeddings")]
+    {
+        let encoders = {
+            let guard = shared.lock().map_err(|e| format!("embedder lock poisoned: {e}"))?;
+            match &guard.engine {
+                Engine::Gemma2(g) if g.media_support().has(kind) => g.encoders(),
+                _ => return Err(NO_MEDIA.into()),
+            }
+        };
+        let soft = crate::gemma2::encode_media_file(&encoders, path, kind)?;
+        let mut guard = shared.lock().map_err(|e| format!("embedder lock poisoned: {e}"))?;
+        match &mut guard.engine {
+            Engine::Gemma2(g) => g.embed_soft_tokens(kind, &soft),
+            Engine::MiniLm(_) => Err(NO_MEDIA.into()),
+        }
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = (shared, path, kind);
+        Err(NO_MEDIA.into())
+    }
+}
+
+/// Which model to use. `CODE_INTEL_MODEL` sets it; the default is `Auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelChoice {
+    /// EmbeddingGemma 2 where this build can run it, MiniLM otherwise — and
+    /// MiniLM whenever the larger model fails to download or load.
+    Auto,
+    /// MiniLM only: the behaviour before EmbeddingGemma 2 existed.
+    MiniLm,
+    /// EmbeddingGemma 2 or nothing. No fallback, so a comparison between the
+    /// two models can never quietly measure MiniLM twice.
+    Gemma2,
+}
+
+impl ModelChoice {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Some(ModelChoice::Auto),
+            "minilm" | "all-minilm-l6-v2" => Some(ModelChoice::MiniLm),
+            "embeddinggemma2" | "embeddinggemma-2" | "gemma2" => Some(ModelChoice::Gemma2),
+            _ => None,
+        }
+    }
+
+    pub fn from_env() -> Self {
+        match std::env::var("CODE_INTEL_MODEL") {
+            Ok(v) => Self::parse(&v).unwrap_or_else(|| {
+                eprintln!("[embeddings] unknown CODE_INTEL_MODEL={v:?}; using auto (auto | minilm | embeddinggemma2)");
+                ModelChoice::Auto
+            }),
+            Err(_) => ModelChoice::Auto,
+        }
+    }
+}
+
+/// Whether this binary can run EmbeddingGemma 2 at all.
+pub const fn gemma2_supported() -> bool {
+    cfg!(feature = "embeddings")
+}
+
+/// Directory of the MiniLM files under a models root (`<cache>/models`).
+pub fn minilm_dir(models_root: &Path) -> std::path::PathBuf {
+    models_root.join(model_cache_dirname())
+}
+
+async fn load_minilm(models_root: &Path) -> Result<SharedEmbedder, String> {
+    let dir = minilm_dir(models_root);
+    ensure_model_downloaded(&dir).await?;
+    let load_dir = dir.clone();
+    match tokio::task::spawn_blocking(move || load_shared(&load_dir)).await {
+        Ok(Ok(shared)) => Ok(shared),
+        Ok(Err(e)) => {
+            // Self-heal a corrupt download: the next run fetches it again
+            // instead of failing the same way forever.
+            let _ = std::fs::remove_dir_all(&dir);
+            Err(e)
+        }
+        Err(e) => Err(format!("embedding model load panicked: {e}")),
+    }
+}
+
+#[cfg(feature = "embeddings")]
+async fn load_gemma2(models_root: &Path, needs: MediaNeeds) -> Result<SharedEmbedder, String> {
+    let dir = models_root.join(crate::gemma2::CACHE_DIRNAME);
+    crate::gemma2::ensure_component_downloaded(&dir, None).await?;
+    let load_dir = dir.clone();
+    // Not removed on failure, unlike MiniLM: these files were hash-checked on
+    // the way in, so a load error means this runtime cannot run the graph —
+    // and re-downloading 175 MB on every start would not change that.
+    let embedder = tokio::task::spawn_blocking(move || CodeEmbedder::load_gemma2(&load_dir))
+        .await
+        .map_err(|e| format!("EmbeddingGemma 2 load panicked: {e}"))??;
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(embedder));
+    extend_media(&shared, needs).await;
+    Ok(shared)
+}
+
+/// A model family, in the order `ensure_and_load` tries them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFamily {
+    Gemma2,
+    MiniLm,
+}
+
+/// Which models to try, in order, for a choice and a build. This is the whole
+/// fallback policy: the first that downloads and loads wins.
+pub fn load_plan(choice: ModelChoice, gemma2_supported: bool) -> &'static [ModelFamily] {
+    match (choice, gemma2_supported) {
+        (ModelChoice::Auto, true) => &[ModelFamily::Gemma2, ModelFamily::MiniLm],
+        (ModelChoice::Auto, false) | (ModelChoice::MiniLm, _) => &[ModelFamily::MiniLm],
+        (ModelChoice::Gemma2, true) => &[ModelFamily::Gemma2],
+        (ModelChoice::Gemma2, false) => &[],
+    }
+}
+
+/// Download (as needed) and load the embedder for a workspace with the given
+/// media. The text model is fetched in every case; a media encoder only when
+/// `needs` says the workspace holds that kind of file.
+pub async fn ensure_and_load(
+    models_root: &Path,
+    choice: ModelChoice,
+    needs: MediaNeeds,
+) -> Result<SharedEmbedder, String> {
+    let plan = load_plan(choice, gemma2_supported());
+    let mut last_error =
+        String::from("EmbeddingGemma 2 needs the ONNX Runtime build; this binary has MiniLM only");
+    for (i, family) in plan.iter().enumerate() {
+        let attempt = match family {
+            #[cfg(feature = "embeddings")]
+            ModelFamily::Gemma2 => load_gemma2(models_root, needs).await,
+            #[cfg(not(feature = "embeddings"))]
+            ModelFamily::Gemma2 => Err(last_error.clone()),
+            ModelFamily::MiniLm => load_minilm(models_root).await,
+        };
+        match attempt {
+            Ok(shared) => return Ok(shared),
+            Err(e) => {
+                if let Some(next) = plan.get(i + 1) {
+                    eprintln!("[embeddings] {family:?} unavailable, falling back to {next:?}: {e}");
+                }
+                last_error = e;
+            }
+        }
+    }
+    let _ = needs;
+    Err(last_error)
+}
+
+/// Give an already-loaded embedder the media encoders `needs` asks for and it
+/// lacks — a second workspace with images joining a process that started on a
+/// text-only one. Best-effort: a failed encoder leaves that kind of media
+/// findable by file name only, and everything else as it was.
+pub async fn extend_media(shared: &SharedEmbedder, needs: MediaNeeds) {
+    #[cfg(feature = "embeddings")]
+    for kind in MediaKind::ALL {
+        if !needs.has(kind) {
+            continue;
+        }
+        // Cheap checks under the embedder's lock; the download and the load
+        // run without it.
+        let slot = {
+            let Ok(guard) = shared.lock() else { return };
+            match &guard.engine {
+                Engine::Gemma2(g) if !g.media_support().has(kind) => {
+                    g.encoder_slot(kind).map(|slot| (slot, g.dir().to_path_buf()))
+                }
+                _ => continue,
+            }
+        };
+        let (encoders, dir) = match slot {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[embeddings] {} search unavailable: {e}", kind.as_str());
+                continue;
+            }
+        };
+        if let Err(e) = crate::gemma2::ensure_component_downloaded(&dir, Some(kind)).await {
+            eprintln!("[embeddings] {} encoder download failed: {e}", kind.as_str());
+            continue;
+        }
+        let loaded = tokio::task::spawn_blocking(move || {
+            encoders
+                .lock()
+                .map_err(|e| format!("encoders lock poisoned: {e}"))?
+                .load(&dir, kind)
+        })
+        .await;
+        match loaded {
+            Ok(Ok(())) => eprintln!("[embeddings] {} encoder ready", kind.as_str()),
+            Ok(Err(e)) => eprintln!("[embeddings] {} encoder failed to load: {e}", kind.as_str()),
+            Err(e) => eprintln!("[embeddings] {} encoder load panicked: {e}", kind.as_str()),
+        }
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = (shared, needs);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fallback policy, for every choice in both kinds of build. The
+    /// default must reach MiniLM whenever the larger model is not an option,
+    /// and an explicit choice must never be swapped for the other model.
+    #[test]
+    fn load_plan_falls_back_to_minilm_only_under_auto() {
+        use ModelFamily::*;
+        assert_eq!(load_plan(ModelChoice::Auto, true), &[Gemma2, MiniLm]);
+        assert_eq!(load_plan(ModelChoice::Auto, false), &[MiniLm]);
+        assert_eq!(load_plan(ModelChoice::MiniLm, true), &[MiniLm]);
+        assert_eq!(load_plan(ModelChoice::MiniLm, false), &[MiniLm]);
+        assert_eq!(load_plan(ModelChoice::Gemma2, true), &[Gemma2]);
+        assert!(load_plan(ModelChoice::Gemma2, false).is_empty());
+        // This build's own answer: the candle and no-backend builds must not
+        // even try the ONNX-only model.
+        let here = load_plan(ModelChoice::Auto, gemma2_supported());
+        assert_eq!(here.contains(&Gemma2), cfg!(feature = "embeddings"));
+        assert_eq!(here.last(), Some(&MiniLm));
+    }
+
+    #[test]
+    fn model_choice_parses_the_documented_values() {
+        assert_eq!(ModelChoice::parse("auto"), Some(ModelChoice::Auto));
+        assert_eq!(ModelChoice::parse(""), Some(ModelChoice::Auto));
+        assert_eq!(ModelChoice::parse(" MiniLM "), Some(ModelChoice::MiniLm));
+        assert_eq!(ModelChoice::parse("embeddinggemma2"), Some(ModelChoice::Gemma2));
+        assert_eq!(ModelChoice::parse("EmbeddingGemma-2"), Some(ModelChoice::Gemma2));
+        assert_eq!(ModelChoice::parse("bge"), None);
+    }
 
     /// Each backend must fetch exactly the files it loads: the ORT build the
     /// ONNX graph, the candle build the safetensors weights — and both the
@@ -949,7 +1311,7 @@ mod tests {
             eprintln!("safetensors weights not present, skipping");
             return;
         }
-        let mut e = CodeEmbedder::load(&dir).expect("load candle model");
+        let mut e = MiniLmEmbedder::load(&dir).expect("load candle model");
 
         let docs = [
             "fn refresh_token_if_stale(session: &mut Session) { /* renew expired auth */ }",
@@ -989,7 +1351,7 @@ mod tests {
             eprintln!("model not present, skipping");
             return;
         }
-        let mut e = CodeEmbedder::load(&dir).expect("load model");
+        let mut e = MiniLmEmbedder::load(&dir).expect("load model");
         for o in e.session.outputs() {
             eprintln!("model output: {}", o.name());
         }
