@@ -1327,6 +1327,20 @@ impl IndexDb {
         Ok(())
     }
 
+    /// How many vectors of `set` the file's symbols hold.
+    pub fn embedding_count_for_file_in(&self, set: VectorSet, file_id: i64) -> Result<i64, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            &format!(
+                "SELECT count(*) FROM {} WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+                set.table()
+            ),
+            params![file_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("count embeddings: {e}"))
+    }
+
     // ── the upgrade set ─────────────────────────────────────────────────
 
     /// The model the upgrade set was written by, if it holds anything.

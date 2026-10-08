@@ -1123,6 +1123,70 @@ fn a_file_edited_and_put_back_is_embedded_again() {
     assert_eq!(db.upgrade_state().unwrap().vectors, vectors);
 }
 
+/// A file edited and put back between two batches of its upgrade comes back
+/// as it was read: same content, same chunks and, the rows of its symbols
+/// being the last ones in the table, the same symbol ids. Only the vectors
+/// stored before the edit are gone. The file must not be marked done on the
+/// strength of the batches that came after.
+#[test]
+fn a_file_edited_and_put_back_between_two_batches_is_not_marked_done_short() {
+    let body = |tag: &str| -> String {
+        (0..40)
+            .map(|i| {
+                format!(
+                    "/// Handles step {i} of the {tag} pipeline.\npub fn {tag}_step_{i}(input: u32) -> u32 {{\n    input + {i}\n}}\n\n"
+                )
+            })
+            .collect()
+    };
+    let (first, second) = (body("ingest"), body("export"));
+    let (db, shared, ws, root) = upgrade_ready_index(&[("pipeline.rs", first.as_str())]);
+    let path = ws.path().join("src").join("pipeline.rs");
+    let path_str = path.to_string_lossy().to_string();
+    let file_id = db.file_by_path(&path_str).unwrap().unwrap().id;
+    let chunks = db.chunks_for_file(file_id).unwrap();
+    let total = chunks.len() as i64;
+    assert!(total > 2 * 4, "more than two batches");
+    let reindex = |content: &str| {
+        std::fs::write(&path, content).unwrap();
+        indexer::reindex_file(&db, &path_str, Some(&mut *shared.lock().unwrap()), Some(&root)).unwrap();
+    };
+
+    let midway = std::thread::scope(|scope| {
+        let upgrade = scope.spawn(|| {
+            indexer::generate_upgrade_embeddings(&db, &shared, None, &root, indexer::UpgradeTurn::default()).unwrap()
+        });
+        // Wait for the first batch to land, then hold the watcher's permit:
+        // the upgrade can store nothing more until it is given back.
+        while db.embedding_count_for_file_in(VectorSet::Upgrade, file_id).unwrap() == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let editing = loop {
+            match claudinio_code_intel::INDEX_SEMAPHORE.try_acquire() {
+                Ok(permit) => break permit,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        };
+        let midway = db.embedding_count_for_file_in(VectorSet::Upgrade, file_id).unwrap();
+        reindex(&second);
+        reindex(&first);
+        drop(editing);
+        upgrade.join().unwrap();
+        midway
+    });
+    assert!(midway < total, "the edit came before the last batch ({midway} of {total})");
+    assert_eq!(db.chunks_for_file(file_id).unwrap(), chunks, "the file came back exactly as it was read");
+
+    // Whatever the pass that was interrupted said, the next one finishes the
+    // file, and the set ends up holding every chunk.
+    let pass =
+        indexer::generate_upgrade_embeddings(&db, &shared, None, &root, indexer::UpgradeTurn::default()).unwrap();
+    assert!(pass.complete);
+    let state = db.upgrade_state().unwrap();
+    assert_eq!(state.pending_files, 0);
+    assert_eq!(state.vectors, total, "one upgrade vector per chunk");
+}
+
 /// The upgrade runs with the watcher free to take edits in — here, the same
 /// file over and over, in both directions, while its chunks are at the
 /// model. Whatever the interleaving, what is left once the dust has settled

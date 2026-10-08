@@ -1015,16 +1015,24 @@ fn upgrade_file(db: &IndexDb, embedder: &SharedEmbedder, path: &str) -> Result<R
     let Some((file_id, hash, chunks)) = snapshot else {
         return Ok(Ok(FileUpgrade::Gone));
     };
-    // Still the file that was read: the same row, the same content and the
-    // same chunks under the same symbols. The hash alone would not do — a
-    // file edited and put back has its hash again and new symbols.
-    let unchanged = || -> Result<bool, String> {
+    // Still the file that was read, with what this attempt stored still in
+    // place: the same row, the same content, the same chunks under the same
+    // symbols, and exactly the vectors stored so far. The hash alone would
+    // not do — a file edited and put back has its hash again and new
+    // symbols. Nor would the chunks: the symbols of the file last written
+    // get their ids back when it is rewritten (SQLite reuses the highest
+    // rowids), so a file edited and put back between two batches reads the
+    // same as before in every column, and only the vectors of the earlier
+    // batches, gone with the old symbols, tell.
+    let unchanged = |stored: usize| -> Result<bool, String> {
         Ok(db
             .file_by_path(path)?
             .is_some_and(|now| now.id == file_id && now.hash.as_deref() == Some(hash.as_str()))
-            && db.chunks_for_file(file_id)? == chunks)
+            && db.chunks_for_file(file_id)? == chunks
+            && db.embedding_count_for_file_in(VectorSet::Upgrade, file_id)? == stored as i64)
     };
 
+    let mut stored_so_far = 0;
     for batch in chunks.chunks(UPGRADE_BATCH_SIZE) {
         yield_to_primary_indexing();
         let texts: Vec<&str> = batch.iter().map(|c| c.embed_text.as_str()).collect();
@@ -1037,7 +1045,7 @@ fn upgrade_file(db: &IndexDb, embedder: &SharedEmbedder, path: &str) -> Result<R
         // at the moment of storing: nothing of an older text ever lands
         // under a newer symbol.
         let stored = while_primary_indexing_is_idle(|| -> Result<bool, String> {
-            if !unchanged()? {
+            if !unchanged(stored_so_far)? {
                 return Ok(false);
             }
             for (c, vector) in batch.iter().zip(encoded.iter()) {
@@ -1055,13 +1063,14 @@ fn upgrade_file(db: &IndexDb, embedder: &SharedEmbedder, path: &str) -> Result<R
         if !stored {
             return Ok(Ok(FileUpgrade::Changed));
         }
+        stored_so_far += batch.len();
         // Same breather as the primary pass, and the gap in which a query
         // waiting for this model gets its turn.
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
 
     let marked = while_primary_indexing_is_idle(|| -> Result<bool, String> {
-        if !unchanged()? {
+        if !unchanged(chunks.len())? {
             return Ok(false);
         }
         db.set_upgrade_hash(file_id, &hash)?;
