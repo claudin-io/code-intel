@@ -4,6 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Run the whole thing, platform matrix included, on any branch by hand.
+  workflow_dispatch:
+    inputs:
+      eval_model:
+        description: "Search eval: auto (the default models) or both (EmbeddingGemma 2 for text as well; over an hour)"
+        type: choice
+        options: [auto, both]
+        default: auto
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,6 +48,200 @@ jobs:
           | timeout 120 cargo run -q -p claudinio-code-intel-mcp ${{ matrix.args }} -- --no-embeddings --workspace . \
           | tee /tmp/mcp.out
           grep -q '"name":"semantic_search"' /tmp/mcp.out
+
+  # Every target a release ships (keep in step with release.yml), built on
+  # each pull request instead of only when a tag is pushed — and tested
+  # wherever the runner can execute what it built. A dependency that does not
+  # compile on Windows, or a decoder that misbehaves on macOS, shows up here
+  # and not on release day.
+  platforms:
+    name: ${{ matrix.name }}
+    if: github.event_name != 'push'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            test: true
+          - name: linux-x64-baseline
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            candle: true
+            test: true
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            test: true
+          - name: darwin-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            test: true
+          - name: darwin-x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            candle: true
+            test: true
+          - name: win32-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            test: true
+          - name: win32-x64-baseline
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            candle: true
+            test: true
+          # Cross-compiled on an x64 runner: built, not run.
+          - name: win32-arm64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: Windows CRT
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "RUSTFLAGS=-Ctarget-feature=-crt-static" >> "$GITHUB_ENV"
+      - name: Baseline codegen (Linux candle)
+        if: matrix.candle && runner.os == 'Linux'
+        shell: bash
+        run: echo "RUSTFLAGS=-Ctarget-cpu=x86-64" >> "$GITHUB_ENV"
+      - name: Backend
+        shell: bash
+        run: |
+          if [ "${{ matrix.candle }}" = "true" ]; then
+            echo "BACKEND_ARGS=--no-default-features --features embeddings-candle" >> "$GITHUB_ENV"
+          fi
+      - name: Build
+        shell: bash
+        run: cargo build -p claudinio-code-intel-mcp --target ${{ matrix.target }} $BACKEND_ARGS
+      # A job's log can only be read signed in; its annotations cannot. So
+      # when tests fail, what failed is repeated as an annotation.
+      - name: Test
+        if: matrix.test
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! cargo test --workspace --no-fail-fast --target ${{ matrix.target }} $BACKEND_ARGS 2>&1 | tee test.log; then
+            { grep -E "^test .* FAILED$|^error" test.log; grep -E -A4 "panicked at" test.log; } \
+              | head -80 | cut -c1-300 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}' > failures.txt
+            echo "::error title=Failing tests (${{ matrix.name }})::$(cat failures.txt)"
+            exit 1
+          fi
+
+  # The real EmbeddingGemma 2 weights: download, load, and check that code,
+  # images and audio are ranked sensibly. Everything else in CI runs against
+  # a stand-in model, so this is the job that notices a re-exported graph or
+  # a preprocessing bug. Its log has the scores and per-file timings.
+  model:
+    name: EmbeddingGemma 2 (real weights)
+    if: github.event_name != 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ort
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: actions/cache@v4
+        with:
+          path: .e2e-models
+          key: embeddinggemma2-${{ hashFiles('crates/code-intel/src/gemma2.rs') }}
+      - run: cargo test -p claudinio-code-intel --test gemma2_e2e -- --ignored --nocapture
+        env:
+          CODE_INTEL_E2E_MODELS: ${{ github.workspace }}/.e2e-models
+          CODE_INTEL_E2E_REPORT: ${{ github.workspace }}/e2e-report.txt
+      # Scores and timings, where they can be read without the log.
+      - name: Report
+        if: always()
+        run: |
+          [ -f e2e-report.txt ] || exit 0
+          { echo '```'; cat e2e-report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=EmbeddingGemma 2 on real weights::$(sed 's/%/%25/g' e2e-report.txt | awk '{printf "%s%%0A", $0}')"
+
+  # Search quality on real queries: the rank of the expected file for each
+  # query, the raw cosine distributions, a sweep over the fusion gates, how
+  # the workspace's images score, and the indexing speed. The workspace is
+  # Claudinio Code at a pinned commit — the repository the query set was
+  # written against. The report is the job summary; the gates in db.rs are
+  # set from it.
+  #
+  # A pull request is measured with the models the server uses by default
+  # (MiniLM for text, EmbeddingGemma 2 for media). Embedding the whole
+  # workspace with EmbeddingGemma 2 as well takes over an hour; that
+  # comparison is run by hand (`eval_model: both`), which is also how
+  # `GEMMA2_MIN_COSINE_CANDIDATE` gets its value.
+  eval:
+    name: Search quality
+    if: github.event_name != 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      EVAL_REPO: https://github.com/claudin-io/claudinio-code
+      EVAL_COMMIT: 9374045be14ba1544093cdac079dbb2c2cc2e088
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ort-release
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: Evaluated workspace
+        run: |
+          git init -q "$RUNNER_TEMP/workspace"
+          git -C "$RUNNER_TEMP/workspace" fetch -q --depth 1 "$EVAL_REPO" "$EVAL_COMMIT"
+          git -C "$RUNNER_TEMP/workspace" checkout -q FETCH_HEAD
+      - uses: actions/cache@v4
+        with:
+          path: .e2e-models
+          key: eval-models-${{ hashFiles('crates/code-intel/src/gemma2.rs', 'crates/code-intel/src/embeddings.rs') }}
+      - name: Eval
+        run: |
+          cargo run --release -p claudinio-code-intel --example semantic_eval -- \
+            "$RUNNER_TEMP/workspace" --models-dir .e2e-models --sweep --report eval-report.txt \
+            --model "${{ inputs.eval_model || 'auto' }}"
+      - name: Report
+        if: always()
+        run: |
+          { echo '```'; cat eval-report.txt 2>/dev/null || echo 'no report was produced'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # The same report as annotations, which need no sign-in to read: the
+      # queries that ranked first are left out (they are in the summary and
+      # the artifact), the rest is cut into pieces an annotation can hold. A
+      # step keeps ten notices, hence two steps.
+      - name: Report as annotations (1/2)
+        if: always()
+        run: |
+          [ -f eval-report.txt ] || exit 0
+          grep -v '^\[rank=1\]' eval-report.txt > eval-brief.txt
+          split -C 3000 -d -a 2 eval-brief.txt part.
+          for f in part.0?; do
+            [ -f "$f" ] || continue
+            echo "::notice title=Eval report ${f#part.}::$(sed 's/%/%25/g' "$f" | awk '{printf "%s%%0A", $0}')"
+          done
+      - name: Report as annotations (2/2)
+        if: always()
+        run: |
+          for f in part.1?; do
+            [ -f "$f" ] || continue
+            echo "::notice title=Eval report ${f#part.}::$(sed 's/%/%25/g' "$f" | awk '{printf "%s%%0A", $0}')"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report
+          path: eval-report.txt
+          if-no-files-found: ignore
 
   node:
     name: Launcher + manifests

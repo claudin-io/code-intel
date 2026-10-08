@@ -3,7 +3,7 @@ name = "claudinio-code-intel"
 version = "0.1.1"
 edition = "2024"
 license = "MIT"
-description = "Local code intelligence: tree-sitter symbols, SQLite FTS5 and MiniLM embeddings fused into one hybrid search. Extracted from Claudinio Code."
+description = "Local code intelligence: tree-sitter symbols, SQLite FTS5 and embeddings (MiniLM for text, EmbeddingGemma 2 for images and audio) fused into one hybrid search. Extracted from Claudinio Code."
 repository = "https://github.com/claudin-io/code-intel"
 keywords = ["code-search", "tree-sitter", "embeddings", "mcp"]
 
@@ -14,8 +14,12 @@ name = "claudinio_code_intel"
 # Same feature split as Claudinio Code (see its src-tauri/Cargo.toml): "embeddings"
 # is ONNX Runtime (prebuilt, needs AVX2/BMI2), "embeddings-candle" is the pure-Rust
 # backend that runs on pre-Haswell CPUs. Neither = lexical (BM25) search only.
+#
+# EmbeddingGemma 2 (text, images, audio) exists only as ONNX graphs, so it and
+# the media decoders it needs ride on "embeddings". The candle build keeps
+# MiniLM and compiles none of this — its dependency tree is unchanged.
 default = ["embeddings"]
-embeddings = ["dep:ort"]
+embeddings = ["dep:ort", "dep:image", "dep:symphonia"]
 embeddings-candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
 
 [dependencies]
@@ -109,6 +113,11 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 notify = "8"
 notify-debouncer-mini = "0.7"
 ort = { version = "2.0.0-rc.12", features = ["download-binaries"], optional = true }
+# Media decoding for the multimodal model. Pure Rust, no system libraries and
+# no default features: only the formats `media.rs` lists, so every target the
+# ORT build ships for compiles them unchanged.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"], optional = true }
+symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "mp3", "flac", "ogg", "vorbis"], optional = true }
 candle-core = { version = "0.11", optional = true }
 candle-nn = { version = "0.11", optional = true }
 candle-transformers = { version = "0.11", optional = true }
@@ -119,3 +128,7 @@ regex = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation"] }
+
+[dev-dependencies]
+# examples/semantic_eval.rs: finds the plugin's model cache.
+dirs = "6"

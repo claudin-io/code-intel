@@ -2,3 +2,4 @@
 /node_modules
 *.part
 .DS_Store
+/.e2e-models

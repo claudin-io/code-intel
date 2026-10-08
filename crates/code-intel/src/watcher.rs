@@ -59,6 +59,7 @@ fn is_indexable_file(path: &Path) -> bool {
     let p = path.to_string_lossy();
     crate::parser::detect_language(&p).is_some()
         || crate::parser::detect_doc_language(&p).is_some()
+        || (crate::media::media_enabled() && crate::media::media_kind(&p).is_some())
 }
 
 pub struct FileWatcher {
@@ -223,13 +224,15 @@ mod tests {
             "web/app.tsx",
             "api/server.rb",
             "native/window.cpp",
+            "assets/logo.png",
+            "sfx/click.wav",
         ] {
             assert!(
                 is_indexable_file(Path::new(accepted)),
                 "should accept {accepted}"
             );
         }
-        for rejected in ["logo.png", "pnpm-lock.lock", "video.mp4", "binary.bin"] {
+        for rejected in ["pnpm-lock.lock", "video.mp4", "binary.bin"] {
             assert!(
                 !is_indexable_file(Path::new(rejected)),
                 "should reject {rejected}"
