@@ -719,10 +719,7 @@ pub fn build_embedding_chunks(
             out.push('\n');
             out.push_str(i18n_copy);
         }
-        let split = crate::text::body_split_words(
-            slice,
-            crate::text::FTS_BODY_SPLIT_CAP_CHARS,
-        );
+        let split = crate::text::body_split_words(slice, crate::text::FTS_BODY_SPLIT_CAP_CHARS);
         if !split.is_empty() {
             out.push('\n');
             out.push_str(&split);
@@ -846,7 +843,11 @@ pub fn required_model_files() -> Vec<(String, &'static str, &'static str, u64)> 
         .iter()
         .filter(|(_, local, _, _)| {
             let is_graph = *local == ACTIVE_MODEL.model_filename;
-            !is_graph || cfg!(not(all(feature = "embeddings-candle", not(feature = "embeddings"))))
+            !is_graph
+                || cfg!(not(all(
+                    feature = "embeddings-candle",
+                    not(feature = "embeddings")
+                )))
         })
         .map(|(remote, local, sha, len)| (format!("{base_url}/{remote}"), *local, *sha, *len))
         .collect();
@@ -866,6 +867,15 @@ pub fn required_model_files() -> Vec<(String, &'static str, &'static str, u64)> 
 }
 
 pub async fn ensure_model_downloaded(cache_dir: &Path) -> Result<(), String> {
+    ensure_model_downloaded_observed(cache_dir, None).await
+}
+
+/// [`ensure_model_downloaded`], reporting each file to `observer` as it
+/// downloads (see [`crate::download::DownloadObserver`]).
+pub async fn ensure_model_downloaded_observed(
+    cache_dir: &Path,
+    observer: Option<&crate::download::DownloadObserver>,
+) -> Result<(), String> {
     if cache_dir.join(model_marker_filename()).exists() {
         return Ok(());
     }
@@ -893,6 +903,7 @@ pub async fn ensure_model_downloaded(cache_dir: &Path) -> Result<(), String> {
             local_filename,
             sha256_hex,
             expected_len,
+            observer,
             DOWNLOAD_RETRIES,
         )
         .await
@@ -928,7 +939,10 @@ mod tests {
         assert!(names.contains(&"tokenizer.json"));
         assert!(names.contains(&"config.json"));
         assert!(names.contains(&model_marker_filename()));
-        let candle = cfg!(all(feature = "embeddings-candle", not(feature = "embeddings")));
+        let candle = cfg!(all(
+            feature = "embeddings-candle",
+            not(feature = "embeddings")
+        ));
         assert_eq!(names.contains(&"model.safetensors"), candle);
         assert_eq!(names.contains(&"model_quantized.onnx"), !candle);
         for f in &files {
