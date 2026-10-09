@@ -20,17 +20,23 @@ const claudeMcp = read(".mcp.json");
 const cursor = read(".cursor-plugin/plugin.json");
 const markets = [".claude-plugin/marketplace.json", ".cursor-plugin/marketplace.json", ".github/plugin/marketplace.json"].map(read);
 
-const cargoVersion = /^version\s*=\s*"([^"]+)"/m.exec(
-  fs.readFileSync(path.join(root, "crates/code-intel-mcp/Cargo.toml"), "utf8"),
-)[1];
+const crateVersion = (crate) =>
+  /^version\s*=\s*"([^"]+)"/m.exec(fs.readFileSync(path.join(root, `crates/${crate}/Cargo.toml`), "utf8"))[1];
 
 test("one version everywhere: crate, package.json, every manifest, every marketplace", () => {
   for (const [what, v] of [
-    ["crates/code-intel-mcp", cargoVersion],
+    ["crates/code-intel-mcp", crateVersion("code-intel-mcp")],
+    // The library is what Claudinio Code pins by tag: its version is the
+    // release's version too, or the app's lockfile names a crate that the tag
+    // does not describe.
+    ["crates/code-intel", crateVersion("code-intel")],
     ["plugin.json", agent.version],
     [".claude-plugin/plugin.json", claude.version],
     [".cursor-plugin/plugin.json", cursor.version],
     ...markets.map((m, i) => [`marketplace #${i} plugin`, m.plugins[0].version]),
+    // Each marketplace lists only this plugin, and every release has bumped
+    // its metadata.version together with the plugin's.
+    ...markets.map((m, i) => [`marketplace #${i} metadata`, m.metadata.version]),
   ]) {
     assert.equal(v, pkg.version, `${what} must carry ${pkg.version}`);
   }
