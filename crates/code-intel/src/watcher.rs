@@ -57,7 +57,8 @@ fn is_ignored_path(root: &Path, path: &Path, gitignore: &Gitignore) -> bool {
 /// workspace reopen).
 fn is_indexable_file(path: &Path) -> bool {
     let p = path.to_string_lossy();
-    crate::parser::detect_language(&p).is_some() || crate::parser::detect_doc_language(&p).is_some()
+    crate::parser::detect_language(&p).is_some()
+        || crate::parser::detect_doc_language(&p).is_some()
 }
 
 pub struct FileWatcher {

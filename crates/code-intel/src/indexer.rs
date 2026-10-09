@@ -783,13 +783,15 @@ pub fn generate_all_embeddings(
         if processed % 10 == 0
             && let Some(p) = progress
         {
-            p(IndexProgress {
-                status: "embedding".into(),
-                files_indexed: processed,
-                symbols_indexed: total_embeddings,
-                total_files: total,
-                workspace: workspace.to_string(),
-            });
+            p(
+                IndexProgress {
+                    status: "embedding".into(),
+                    files_indexed: processed,
+                    symbols_indexed: total_embeddings,
+                    total_files: total,
+                    workspace: workspace.to_string(),
+                },
+            );
         }
     }
 
@@ -1026,27 +1028,17 @@ mod rescan_keeps_doc_embeddings {
         assert!(!chunks.is_empty(), "the doc produced embeddable chunks");
         // Stand in for the embedding pass: vectors stored, file marked done.
         for c in &chunks {
-            db.upsert_embedding(
-                c.symbol_id,
-                c.chunk_index,
-                c.start_line,
-                c.end_line,
-                &[1.0; 384],
-            )
-            .unwrap();
+            db.upsert_embedding(c.symbol_id, c.chunk_index, c.start_line, c.end_line, &[1.0; 384])
+                .unwrap();
         }
-        db.set_embed_hash(file.id, file.hash.as_deref().unwrap())
-            .unwrap();
+        db.set_embed_hash(file.id, file.hash.as_deref().unwrap()).unwrap();
         let (_, _, before) = db.index_stats().unwrap();
         assert_eq!(before as usize, chunks.len());
 
         scan_workspace(&db, &root, None, None, None).unwrap();
 
         let (_, _, after) = db.index_stats().unwrap();
-        assert_eq!(
-            after, before,
-            "a rescan of an unchanged doc must not drop its embeddings"
-        );
+        assert_eq!(after, before, "a rescan of an unchanged doc must not drop its embeddings");
         assert_eq!(db.embedding_pending_files().unwrap(), 0);
     }
 }

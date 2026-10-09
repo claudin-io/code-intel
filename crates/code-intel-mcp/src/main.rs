@@ -283,11 +283,7 @@ impl CodeIntel {
             (Phase::Failed, _) => format!(
                 "index failed for {}: {}",
                 ws.root.display(),
-                ws.error
-                    .lock()
-                    .ok()
-                    .and_then(|e| e.clone())
-                    .unwrap_or_default()
+                ws.error.lock().ok().and_then(|e| e.clone()).unwrap_or_default()
             ),
             (_, Some(p)) => format!(
                 "index not ready: {} of {} files scanned in {} — retry in a moment (or grep meanwhile)",
@@ -342,10 +338,7 @@ impl CodeIntel {
         name = "open_workspace",
         description = "Index a directory (absolute path). Call it with the project root when index_status lists no workspace, or for a second directory outside the project. Every search tool also accepts `workspace` and opens it on demand."
     )]
-    async fn open_workspace(
-        &self,
-        Parameters(p): Parameters<OpenParams>,
-    ) -> Result<String, String> {
+    async fn open_workspace(&self, Parameters(p): Parameters<OpenParams>) -> Result<String, String> {
         let ws = self.open_root(PathBuf::from(&p.path)).await?;
         Ok(pretty(&serde_json::json!({
             "workspace": ws.root,
@@ -360,9 +353,7 @@ impl CodeIntel {
     async fn code_search(&self, Parameters(p): Parameters<QueryParams>) -> Result<String, String> {
         let ws = self.pick(p.workspace.as_deref(), None).await?;
         Self::require_symbols(&ws)?;
-        let results = ws
-            .db
-            .search_symbols(&p.query, p.limit.unwrap_or(20).max(1))?;
+        let results = ws.db.search_symbols(&p.query, p.limit.unwrap_or(20).max(1))?;
         Ok(pretty(&results))
     }
 
@@ -382,9 +373,7 @@ impl CodeIntel {
         description = "List all symbols defined in a file (functions, classes, methods, types…) with their line ranges. Use it before reading a file to see its structure at a glance."
     )]
     async fn file_outline(&self, Parameters(p): Parameters<FileParams>) -> Result<String, String> {
-        let ws = self
-            .pick(p.workspace.as_deref(), Some(&p.file_path))
-            .await?;
+        let ws = self.pick(p.workspace.as_deref(), Some(&p.file_path)).await?;
         Self::require_symbols(&ws)?;
         let path = ws.resolve_path(&p.file_path);
         let results = ws.db.symbols_in_file(&path)?;
@@ -395,13 +384,8 @@ impl CodeIntel {
         name = "find_callers",
         description = "Symbols that call or reference a symbol by name, from the call relations tree-sitter recorded at index time. Cheaper than grep for 'who uses this?'; results are the definitions of the callers, not every textual occurrence."
     )]
-    async fn find_callers(
-        &self,
-        Parameters(p): Parameters<CallersParams>,
-    ) -> Result<String, String> {
-        let ws = self
-            .pick(p.workspace.as_deref(), p.file_path.as_deref())
-            .await?;
+    async fn find_callers(&self, Parameters(p): Parameters<CallersParams>) -> Result<String, String> {
+        let ws = self.pick(p.workspace.as_deref(), p.file_path.as_deref()).await?;
         Self::require_symbols(&ws)?;
         let exclude = p.file_path.map(|f| ws.resolve_path(&f)).unwrap_or_default();
         let results = ws.db.callers_of(&p.name, &exclude)?;
@@ -455,11 +439,7 @@ impl CodeIntel {
         attach_snippets(&mut results);
 
         let pending = ws.db.embedding_pending_files().unwrap_or(0);
-        let mode = if query_vec.is_some() {
-            "hybrid"
-        } else {
-            "lexical-only"
-        };
+        let mode = if query_vec.is_some() { "hybrid" } else { "lexical-only" };
         let note = if query_vec.is_none() {
             Some(if pending > 0 {
                 format!(
@@ -680,11 +660,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "error": ws.error.lock().ok().and_then(|e| e.clone()),
             }))
         );
-        return if ws.phase() == Phase::Failed {
-            std::process::exit(1)
-        } else {
-            Ok(())
-        };
+        return if ws.phase() == Phase::Failed { std::process::exit(1) } else { Ok(()) };
     }
 
     let server = CodeIntel::new(cli.opts.clone());
@@ -715,10 +691,7 @@ mod tests {
     use super::*;
 
     fn opts(dir: &Path) -> Options {
-        Options {
-            cache_dir: dir.join("cache"),
-            embeddings: false,
-        }
+        Options { cache_dir: dir.join("cache"), embeddings: false }
     }
 
     /// Copilot starts the server with cwd = the plugin's own install dir and
@@ -728,17 +701,10 @@ mod tests {
     fn the_plugin_install_dir_is_never_the_default_workspace() {
         let plugin = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        let env =
-            |k: &str| (k == "COPILOT_PLUGIN_ROOT").then(|| plugin.path().as_os_str().to_owned());
+        let env = |k: &str| (k == "COPILOT_PLUGIN_ROOT").then(|| plugin.path().as_os_str().to_owned());
         assert_eq!(default_workspace(plugin.path(), env), None);
-        assert_eq!(
-            default_workspace(project.path(), env),
-            Some(canonical(project.path()))
-        );
-        assert_eq!(
-            default_workspace(plugin.path(), |_| None),
-            Some(canonical(plugin.path()))
-        );
+        assert_eq!(default_workspace(project.path(), env), Some(canonical(project.path())));
+        assert_eq!(default_workspace(plugin.path(), |_| None), Some(canonical(plugin.path())));
     }
 
     /// The agent passes the project path as `workspace` before anything is
@@ -750,19 +716,11 @@ mod tests {
         let project = tmp.path().join("proj");
         std::fs::create_dir(&project).unwrap();
         let server = CodeIntel::new(opts(tmp.path()));
-        let ws = server
-            .pick(Some(project.to_str().unwrap()), None)
-            .await
-            .unwrap();
+        let ws = server.pick(Some(project.to_str().unwrap()), None).await.unwrap();
         assert_eq!(ws.root, canonical(&project));
         assert_eq!(server.workspaces.read().await.len(), 1);
         // and a path that is not a directory still errors
         let missing = tmp.path().join("nope");
-        assert!(
-            server
-                .pick(Some(missing.to_str().unwrap()), None)
-                .await
-                .is_err()
-        );
+        assert!(server.pick(Some(missing.to_str().unwrap()), None).await.is_err());
     }
 }
