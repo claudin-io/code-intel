@@ -9,6 +9,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # Unchecked, formatting drifted: a contributor's `cargo fmt` then
+      # reformats files nobody touched and the diff stops being about the change.
+      - run: cargo fmt --all --check
+
   rust:
     name: Rust (${{ matrix.backend }})
     runs-on: ubuntu-24.04

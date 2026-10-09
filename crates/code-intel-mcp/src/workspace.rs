@@ -89,7 +89,8 @@ impl Workspace {
     pub fn open(root: PathBuf, cache_dir: &Path) -> Result<Arc<Self>, String> {
         let db_path = index_db_path(cache_dir, &root);
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
         let db = Arc::new(IndexDb::open(&db_path)?);
         Ok(Arc::new(Self {
@@ -123,10 +124,7 @@ impl Workspace {
     /// True once the tree-sitter scan has finished at least once for this
     /// process — lexical tools may answer.
     pub fn symbols_ready(&self) -> bool {
-        self.progress
-            .lock()
-            .map(|p| p.is_none())
-            .unwrap_or(false)
+        self.progress.lock().map(|p| p.is_none()).unwrap_or(false)
     }
 
     pub fn current_embedder(&self) -> Option<SharedEmbedder> {
